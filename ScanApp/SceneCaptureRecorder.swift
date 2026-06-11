@@ -17,6 +17,11 @@ struct SceneCaptureRecorderStatus {
     let lastDecision: String
 }
 
+struct SavedSceneCapture {
+    let imageName: String
+    let cameraTransform: simd_float4x4
+}
+
 final class SceneCaptureRecorder {
     private let writerQueue = DispatchQueue(label: "dokidoki.ScanApp.sceneCaptureWriter", qos: .utility)
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
@@ -42,6 +47,8 @@ final class SceneCaptureRecorder {
     private var previousFrameTimestamp: TimeInterval?
     private var previousFrameTransform: simd_float4x4?
     private var lastDecision = "Recorder idle"
+
+    var onCaptureSaved: ((SavedSceneCapture) -> Void)?
 
     var status: SceneCaptureRecorderStatus {
         SceneCaptureRecorderStatus(savedImageCount: savedImageCount, lastDecision: lastDecision)
@@ -128,6 +135,7 @@ final class SceneCaptureRecorder {
             )
             let metadataData = try makeMetadataData(metadata)
             let pixelBuffer = frame.capturedImage
+            let cameraTransform = frame.camera.transform
 
             pendingWriteCount += 1
             acceptedCaptureCount += 1
@@ -141,6 +149,7 @@ final class SceneCaptureRecorder {
                 metadataData: metadataData,
                 metadataURL: metadataURL,
                 imageName: imageName,
+                cameraTransform: cameraTransform,
                 generation: recordingGeneration
             )
         } catch {
@@ -256,6 +265,7 @@ final class SceneCaptureRecorder {
         metadataData: Data,
         metadataURL: URL,
         imageName: String,
+        cameraTransform: simd_float4x4,
         generation: Int
     ) {
         let jpegQuality = jpegQuality
@@ -267,12 +277,22 @@ final class SceneCaptureRecorder {
             }
 
             DispatchQueue.main.async {
-                self?.finishCaptureWrite(result, imageName: imageName, generation: generation)
+                self?.finishCaptureWrite(
+                    result,
+                    imageName: imageName,
+                    cameraTransform: cameraTransform,
+                    generation: generation
+                )
             }
         }
     }
 
-    private func finishCaptureWrite(_ result: Result<Void, Error>, imageName: String, generation: Int) {
+    private func finishCaptureWrite(
+        _ result: Result<Void, Error>,
+        imageName: String,
+        cameraTransform: simd_float4x4,
+        generation: Int
+    ) {
         guard generation == recordingGeneration else { return }
 
         pendingWriteCount = max(0, pendingWriteCount - 1)
@@ -282,6 +302,7 @@ final class SceneCaptureRecorder {
             savedImageCount += 1
             lastDecision = "Saved \(imageName)"
             notifyCaptureSaved()
+            onCaptureSaved?(SavedSceneCapture(imageName: imageName, cameraTransform: cameraTransform))
         case .failure(let error):
             lastDecision = "Save failed: \(error.localizedDescription)"
         }

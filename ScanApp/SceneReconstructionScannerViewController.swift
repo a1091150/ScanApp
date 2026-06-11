@@ -18,6 +18,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private let stackView = UIStackView()
     private let startStopButton = UIButton(type: .system)
     private let resetButton = UIButton(type: .system)
+    private let exportOBJButton = UIButton(type: .system)
 
     private let supportLabel = UILabel()
     private let trackingLabel = UILabel()
@@ -38,6 +39,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private var confidenceStatus = "Confidence: unavailable"
     private var scanTimestamp: String?
     private var scanDirectory: URL?
+    private var cameraMarkerAnchors: [AnchorEntity] = []
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         .landscapeRight
@@ -57,6 +59,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         title = "Scene Reconstruction"
         view.backgroundColor = .black
         configureARView()
+        configureCaptureRecorder()
         configureUI()
         configureNavigation()
         evaluateDeviceSupport()
@@ -72,8 +75,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         arView.translatesAutoresizingMaskIntoConstraints = false
         arView.automaticallyConfigureSession = false
         arView.session.delegate = self
-        arView.debugOptions.insert(.showSceneUnderstanding)
-        arView.debugOptions.insert(.showFeaturePoints)
+        arView.debugOptions.insert(.showStatistics)
         arView.debugOptions.insert(.showWorldOrigin)
 
         view.addSubview(arView)
@@ -83,6 +85,12 @@ final class SceneReconstructionScannerViewController: UIViewController {
             arView.topAnchor.constraint(equalTo: view.topAnchor),
             arView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
+    }
+
+    private func configureCaptureRecorder() {
+        captureRecorder.onCaptureSaved = { [weak self] capture in
+            self?.addCameraMarker(for: capture)
+        }
     }
 
     private func configureUI() {
@@ -134,7 +142,14 @@ final class SceneReconstructionScannerViewController: UIViewController {
         resetButton.layer.cornerRadius = 8
         resetButton.addTarget(self, action: #selector(resetScan), for: .touchUpInside)
 
-        let buttonStack = makeButtonRow([startStopButton, resetButton])
+        exportOBJButton.setTitle("Export OBJ", for: .normal)
+        exportOBJButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
+        exportOBJButton.tintColor = .white
+        exportOBJButton.backgroundColor = .systemBlue
+        exportOBJButton.layer.cornerRadius = 8
+        exportOBJButton.addTarget(self, action: #selector(exportOBJ), for: .touchUpInside)
+
+        let buttonStack = makeButtonRow([startStopButton, resetButton, exportOBJButton])
         buttonStack.spacing = 10
         buttonStack.distribution = .fillEqually
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
@@ -241,6 +256,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         configuration.environmentTexturing = .automatic
         meshStore.reset()
         captureRecorder.reset()
+        removeCameraMarkers()
         isRecordingImages = false
         resetScanDirectory()
 
@@ -277,6 +293,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     @objc private func resetScan() {
         meshStore.reset()
         captureRecorder.reset()
+        removeCameraMarkers()
         isRecordingImages = false
         depthStatus = "Depth: unavailable"
         confidenceStatus = "Confidence: unavailable"
@@ -287,6 +304,17 @@ final class SceneReconstructionScannerViewController: UIViewController {
             startScanning()
         } else {
             updateStats()
+        }
+    }
+
+    @objc private func exportOBJ() {
+        do {
+            let directory = try currentScanDirectory()
+            let objURL = directory.appendingPathComponent("scene_reconstruction.obj")
+            try meshStore.exportOBJ(to: objURL)
+            showAlert(title: "OBJ Saved", message: objURL.path)
+        } catch {
+            showAlert(title: "OBJ Export Failed", message: error.localizedDescription)
         }
     }
 
@@ -403,6 +431,37 @@ final class SceneReconstructionScannerViewController: UIViewController {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+
+    private func addCameraMarker(for capture: SavedSceneCapture) {
+        let anchor = AnchorEntity(world: capture.cameraTransform)
+        let originMaterial = SimpleMaterial(color: .white, isMetallic: false)
+        let forwardMaterial = SimpleMaterial(color: .systemBlue, isMetallic: false)
+        let rightMaterial = SimpleMaterial(color: .systemRed, isMetallic: false)
+        let upMaterial = SimpleMaterial(color: .systemGreen, isMetallic: false)
+
+        let origin = ModelEntity(mesh: .generateSphere(radius: 0.018), materials: [originMaterial])
+        let forward = ModelEntity(mesh: .generateSphere(radius: 0.012), materials: [forwardMaterial])
+        let right = ModelEntity(mesh: .generateSphere(radius: 0.009), materials: [rightMaterial])
+        let up = ModelEntity(mesh: .generateSphere(radius: 0.009), materials: [upMaterial])
+
+        forward.position = SIMD3<Float>(0, 0, -0.11)
+        right.position = SIMD3<Float>(0.07, 0, 0)
+        up.position = SIMD3<Float>(0, 0.07, 0)
+
+        anchor.name = "saved_camera_\(capture.imageName)"
+        anchor.addChild(origin)
+        anchor.addChild(forward)
+        anchor.addChild(right)
+        anchor.addChild(up)
+
+        arView.scene.addAnchor(anchor)
+        cameraMarkerAnchors.append(anchor)
+    }
+
+    private func removeCameraMarkers() {
+        cameraMarkerAnchors.forEach { arView.scene.removeAnchor($0) }
+        cameraMarkerAnchors.removeAll()
     }
 }
 
