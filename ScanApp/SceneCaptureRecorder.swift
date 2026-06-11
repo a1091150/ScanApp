@@ -18,7 +18,7 @@ struct SceneCaptureRecorderStatus {
 }
 
 final class SceneCaptureRecorder {
-    private let ciContext = CIContext()
+    private let writerQueue = DispatchQueue(label: "dokidoki.ScanApp.sceneCaptureWriter", qos: .utility)
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
     private let jpegQuality: CGFloat = 0.92
     private let minCaptureInterval: TimeInterval = 0.45
@@ -26,6 +26,7 @@ final class SceneCaptureRecorder {
     private let minRotationDeltaRadians: Float = 7 * .pi / 180
     private let maxVelocity: Float = 0.5
     private let maxAngularVelocity: Float = 0.7
+    private let maxPendingWrites = 2
 
     private var sessionDirectory: URL?
     private var imagesDirectory: URL?
@@ -33,6 +34,9 @@ final class SceneCaptureRecorder {
     private var isRecording = false
     private var frameIndex = 0
     private var savedImageCount = 0
+    private var pendingWriteCount = 0
+    private var acceptedCaptureCount = 0
+    private var recordingGeneration = 0
     private var lastSavedTimestamp: TimeInterval?
     private var lastSavedTransform: simd_float4x4?
     private var previousFrameTimestamp: TimeInterval?
@@ -56,6 +60,7 @@ final class SceneCaptureRecorder {
         }
 
         isRecording = true
+        recordingGeneration += 1
         lastDecision = "Recorder started"
         prepareCaptureHaptic()
     }
@@ -72,6 +77,9 @@ final class SceneCaptureRecorder {
         metadataDirectory = nil
         frameIndex = 0
         savedImageCount = 0
+        pendingWriteCount = 0
+        acceptedCaptureCount = 0
+        recordingGeneration += 1
         lastSavedTimestamp = nil
         lastSavedTransform = nil
         previousFrameTimestamp = nil
@@ -100,12 +108,16 @@ final class SceneCaptureRecorder {
         }
 
         do {
+            guard pendingWriteCount < maxPendingWrites else {
+                lastDecision = "Skipped: writer queue busy"
+                return
+            }
+
             let frameName = String(format: "frame_%06d", frameIndex)
             let imageName = "\(frameName).jpg"
             let metadataName = "\(frameName).json"
             let imageURL = imagesDirectory.appendingPathComponent(imageName)
             let metadataURL = metadataDirectory.appendingPathComponent(metadataName)
-            try writeJPEG(from: frame.capturedImage, to: imageURL)
 
             let metadata = makeMetadata(
                 frame: frame,
@@ -114,13 +126,23 @@ final class SceneCaptureRecorder {
                 interfaceOrientation: interfaceOrientation,
                 motion: motion
             )
-            try writeMetadata(metadata, to: metadataURL)
+            let metadataData = try makeMetadataData(metadata)
+            let pixelBuffer = frame.capturedImage
 
-            savedImageCount += 1
+            pendingWriteCount += 1
+            acceptedCaptureCount += 1
             lastSavedTimestamp = frame.timestamp
             lastSavedTransform = frame.camera.transform
-            lastDecision = "Saved \(imageName)"
-            notifyCaptureSaved()
+            lastDecision = "Queued \(imageName)"
+
+            enqueueCaptureWrite(
+                pixelBuffer: pixelBuffer,
+                imageURL: imageURL,
+                metadataData: metadataData,
+                metadataURL: metadataURL,
+                imageName: imageName,
+                generation: recordingGeneration
+            )
         } catch {
             lastDecision = "Save failed: \(error.localizedDescription)"
         }
@@ -131,7 +153,7 @@ final class SceneCaptureRecorder {
             return (false, "Skipped: tracking not normal")
         }
 
-        if savedImageCount == 0 {
+        if acceptedCaptureCount == 0 {
             return (true, "Capture: first frame")
         }
 
@@ -182,21 +204,6 @@ final class SceneCaptureRecorder {
         )
     }
 
-    private func writeJPEG(from pixelBuffer: CVPixelBuffer, to url: URL) throws {
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-        guard let data = ciContext.jpegRepresentation(
-            of: image,
-            colorSpace: colorSpace,
-            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegQuality]
-        ) else {
-            throw SceneCaptureRecorderError.jpegEncodingFailed
-        }
-
-        try data.write(to: url, options: .atomic)
-    }
-
     private func makeMetadata(
         frame: ARFrame,
         imageRelativePath: String,
@@ -239,9 +246,45 @@ final class SceneCaptureRecorder {
         ]
     }
 
-    private func writeMetadata(_ object: [String: Any], to url: URL) throws {
-        let jsonData = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        try jsonData.write(to: url, options: .atomic)
+    private func makeMetadataData(_ object: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private func enqueueCaptureWrite(
+        pixelBuffer: CVPixelBuffer,
+        imageURL: URL,
+        metadataData: Data,
+        metadataURL: URL,
+        imageName: String,
+        generation: Int
+    ) {
+        let jpegQuality = jpegQuality
+
+        writerQueue.async { [weak self] in
+            let result = Result<Void, Error> {
+                try writeJPEG(pixelBuffer: pixelBuffer, to: imageURL, jpegQuality: jpegQuality)
+                try metadataData.write(to: metadataURL, options: .atomic)
+            }
+
+            DispatchQueue.main.async {
+                self?.finishCaptureWrite(result, imageName: imageName, generation: generation)
+            }
+        }
+    }
+
+    private func finishCaptureWrite(_ result: Result<Void, Error>, imageName: String, generation: Int) {
+        guard generation == recordingGeneration else { return }
+
+        pendingWriteCount = max(0, pendingWriteCount - 1)
+
+        switch result {
+        case .success:
+            savedImageCount += 1
+            lastDecision = "Saved \(imageName)"
+            notifyCaptureSaved()
+        case .failure(let error):
+            lastDecision = "Save failed: \(error.localizedDescription)"
+        }
     }
 
     private func prepareCaptureHaptic() {
@@ -262,6 +305,22 @@ private struct FrameMotion {
     let velocity: Float
     let angularVelocity: Float
     let motionQuality: Float
+}
+
+private func writeJPEG(pixelBuffer: CVPixelBuffer, to url: URL, jpegQuality: CGFloat) throws {
+    let image = CIImage(cvPixelBuffer: pixelBuffer)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = CIContext()
+
+    guard let data = context.jpegRepresentation(
+        of: image,
+        colorSpace: colorSpace,
+        options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegQuality]
+    ) else {
+        throw SceneCaptureRecorderError.jpegEncodingFailed
+    }
+
+    try data.write(to: url, options: .atomic)
 }
 
 private enum SceneCaptureRecorderError: LocalizedError {
