@@ -12,12 +12,12 @@ import UIKit
 final class SceneReconstructionScannerViewController: UIViewController {
     private let arView = ARView(frame: .zero)
     private let meshStore = SceneMeshStore()
+    private let captureRecorder = SceneCaptureRecorder()
 
     private let statusPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
     private let stackView = UIStackView()
     private let startStopButton = UIButton(type: .system)
     private let resetButton = UIButton(type: .system)
-    private let exportButton = UIButton(type: .system)
 
     private let supportLabel = UILabel()
     private let trackingLabel = UILabel()
@@ -27,12 +27,29 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private let worldPointCountLabel = UILabel()
     private let depthLabel = UILabel()
     private let confidenceLabel = UILabel()
+    private let imageCaptureLabel = UILabel()
+    private let imageDecisionLabel = UILabel()
 
     private var isScanning = false
+    private var isRecordingImages = false
     private var canStartScan = true
     private var supportStatus = "Not checked"
     private var depthStatus = "Depth: unavailable"
     private var confidenceStatus = "Confidence: unavailable"
+    private var scanTimestamp: String?
+    private var scanDirectory: URL?
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        .landscapeRight
+    }
+
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
+        .landscapeRight
+    }
+
+    override var shouldAutorotate: Bool {
+        true
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -117,15 +134,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         resetButton.layer.cornerRadius = 8
         resetButton.addTarget(self, action: #selector(resetScan), for: .touchUpInside)
 
-        exportButton.setTitle("Export OBJ", for: .normal)
-        exportButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
-        exportButton.tintColor = .white
-        exportButton.backgroundColor = .systemBlue
-        exportButton.layer.cornerRadius = 8
-        exportButton.addTarget(self, action: #selector(exportOBJ), for: .touchUpInside)
-
-        let buttonStack = UIStackView(arrangedSubviews: [startStopButton, resetButton, exportButton])
-        buttonStack.axis = .horizontal
+        let buttonStack = makeButtonRow([startStopButton, resetButton])
         buttonStack.spacing = 10
         buttonStack.distribution = .fillEqually
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
@@ -137,6 +146,14 @@ final class SceneReconstructionScannerViewController: UIViewController {
             buttonStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
             buttonStack.heightAnchor.constraint(equalToConstant: 48)
         ])
+    }
+
+    private func makeButtonRow(_ buttons: [UIButton]) -> UIStackView {
+        let row = UIStackView(arrangedSubviews: buttons)
+        row.axis = .horizontal
+        row.spacing = 10
+        row.distribution = .fillEqually
+        return row
     }
 
     private func configureStatusPanel() {
@@ -156,7 +173,9 @@ final class SceneReconstructionScannerViewController: UIViewController {
             faceCountLabel,
             worldPointCountLabel,
             depthLabel,
-            confidenceLabel
+            confidenceLabel,
+            imageCaptureLabel,
+            imageDecisionLabel
         ].forEach(configureStatusLabel(_:))
 
         view.addSubview(statusPanel)
@@ -221,22 +240,47 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
         configuration.environmentTexturing = .automatic
         meshStore.reset()
-        arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-        isScanning = true
-        updateStats()
+        captureRecorder.reset()
+        isRecordingImages = false
+        resetScanDirectory()
+
+        do {
+            let directory = try currentScanDirectory()
+            try captureRecorder.start(sessionDirectory: directory)
+            isRecordingImages = true
+            arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+            isScanning = true
+            updateStats()
+        } catch {
+            isScanning = false
+            isRecordingImages = false
+            showAlert(title: "Scan Start Failed", message: error.localizedDescription)
+            updateStats()
+        }
     }
 
     private func stopScanning() {
         guard isScanning else { return }
         arView.session.pause()
+        stopImageRecording()
         isScanning = false
+        updateStats()
+    }
+
+    private func stopImageRecording() {
+        guard isRecordingImages else { return }
+        captureRecorder.stop()
+        isRecordingImages = false
         updateStats()
     }
 
     @objc private func resetScan() {
         meshStore.reset()
+        captureRecorder.reset()
+        isRecordingImages = false
         depthStatus = "Depth: unavailable"
         confidenceStatus = "Confidence: unavailable"
+        resetScanDirectory()
 
         if isScanning {
             isScanning = false
@@ -246,25 +290,22 @@ final class SceneReconstructionScannerViewController: UIViewController {
         }
     }
 
-    @objc private func exportOBJ() {
-        guard meshStore.vertexCount > 0 else {
-            showAlert(title: "No Mesh Data", message: "Start scanning and collect mesh anchors before exporting.")
-            return
+    private func resetScanDirectory() {
+        scanTimestamp = nil
+        scanDirectory = nil
+    }
+
+    private func currentScanDirectory() throws -> URL {
+        if let scanDirectory {
+            return scanDirectory
         }
 
-        let timestamp = makeExportTimestamp()
-
-        do {
-            let exportDirectory = try makeExportDirectory(timestamp: timestamp)
-            let fileURL = exportDirectory.appendingPathComponent(makeOBJFileName(timestamp: timestamp))
-            try meshStore.exportOBJ(to: fileURL)
-            let activityController = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
-            activityController.popoverPresentationController?.sourceView = exportButton
-            activityController.popoverPresentationController?.sourceRect = exportButton.bounds
-            present(activityController, animated: true)
-        } catch {
-            showAlert(title: "Export Failed", message: error.localizedDescription)
-        }
+        let timestamp = scanTimestamp ?? makeExportTimestamp()
+        scanTimestamp = timestamp
+        let directory = try makeScanDirectory(timestamp: timestamp)
+        scanDirectory = directory
+        try writeSessionMetadata(to: directory, timestamp: timestamp)
+        return directory
     }
 
     private func makeExportTimestamp() -> String {
@@ -273,7 +314,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         return formatter.string(from: Date())
     }
 
-    private func makeExportDirectory(timestamp: String) throws -> URL {
+    private func makeScanDirectory(timestamp: String) throws -> URL {
         let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let exportDirectory = documentsDirectory
             .appendingPathComponent("SceneReconstructionScans", isDirectory: true)
@@ -282,8 +323,21 @@ final class SceneReconstructionScannerViewController: UIViewController {
         return exportDirectory
     }
 
-    private func makeOBJFileName(timestamp: String) -> String {
-        "scene_reconstruction_\(timestamp).obj"
+    private func writeSessionMetadata(to directory: URL, timestamp: String) throws {
+        let metadataURL = directory.appendingPathComponent("session.json")
+        let metadata: [String: Any] = [
+            "session_id": timestamp,
+            "created_at": ISO8601DateFormatter().string(from: Date()),
+            "image_orientation": "landscapeRight",
+            "projection_orientation": "landscapeRight",
+            "required_orientation": "landscapeRight",
+            "dataset_layout": [
+                "images": "images/frame_000001.jpg",
+                "metadata": "metadata/frame_000001.json"
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: metadataURL, options: .atomic)
     }
 
     private func updateStats(trackingState: ARCamera.TrackingState? = nil) {
@@ -291,9 +345,8 @@ final class SceneReconstructionScannerViewController: UIViewController {
         startStopButton.backgroundColor = isScanning ? .systemRed : .systemGreen
         startStopButton.isEnabled = canStartScan
         startStopButton.alpha = canStartScan ? 1 : 0.55
-        exportButton.isEnabled = meshStore.vertexCount > 0
-        exportButton.alpha = exportButton.isEnabled ? 1 : 0.55
 
+        let recorderStatus = captureRecorder.status
         supportLabel.text = "Support: \(supportStatus)"
         trackingLabel.text = "Tracking: \(trackingText(for: trackingState ?? arView.session.currentFrame?.camera.trackingState))"
         anchorCountLabel.text = "Mesh anchors: \(meshStore.anchorCount)"
@@ -302,6 +355,8 @@ final class SceneReconstructionScannerViewController: UIViewController {
         worldPointCountLabel.text = "World points: \(meshStore.vertexCount)"
         depthLabel.text = depthStatus
         confidenceLabel.text = confidenceStatus
+        imageCaptureLabel.text = "Saved images: \(recorderStatus.savedImageCount)"
+        imageDecisionLabel.text = "Image recorder: \(recorderStatus.lastDecision)"
     }
 
     private func updateDepthStatus(from frame: ARFrame) {
@@ -369,6 +424,7 @@ extension SceneReconstructionScannerViewController: ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateDepthStatus(from: frame)
+        captureRecorder.process(frame: frame, interfaceOrientation: currentInterfaceOrientation)
         updateStats(trackingState: frame.camera.trackingState)
     }
 
@@ -390,5 +446,11 @@ extension SceneReconstructionScannerViewController: ARSessionDelegate {
     func sessionInterruptionEnded(_ session: ARSession) {
         supportStatus = "Session interruption ended"
         updateStats()
+    }
+}
+
+private extension SceneReconstructionScannerViewController {
+    var currentInterfaceOrientation: UIInterfaceOrientation {
+        view.window?.windowScene?.interfaceOrientation ?? .landscapeRight
     }
 }
