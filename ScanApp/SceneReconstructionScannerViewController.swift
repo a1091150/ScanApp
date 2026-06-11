@@ -350,9 +350,10 @@ final class SceneReconstructionScannerViewController: UIViewController {
             "projection_orientation": "landscapeRight",
             "required_orientation": "landscapeRight",
             "dataset_layout": [
-                "video": "capture.mp4",
+                "images": "images/frame_000001.jpg",
                 "metadata": "metadata/frame_000001.json",
-                "derived_images": "images/frame_000001.jpg"
+                "video": "capture.mp4",
+                "video_enabled": false
             ]
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
@@ -374,7 +375,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         worldPointCountLabel.text = "World points: \(meshStore.vertexCount)"
         depthLabel.text = depthStatus
         confidenceLabel.text = confidenceStatus
-        imageCaptureLabel.text = "Saved video frames: \(recorderStatus.savedImageCount)"
+        imageCaptureLabel.text = "Saved images: \(recorderStatus.savedImageCount)"
         imageDecisionLabel.text = "Image recorder: \(recorderStatus.lastDecision)"
     }
 
