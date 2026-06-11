@@ -19,6 +19,7 @@ struct SceneCaptureRecorderStatus {
 
 final class SceneCaptureRecorder {
     private let ciContext = CIContext()
+    private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
     private let jpegQuality: CGFloat = 0.92
     private let minCaptureInterval: TimeInterval = 0.45
     private let minTranslationDelta: Float = 0.05
@@ -56,6 +57,7 @@ final class SceneCaptureRecorder {
 
         isRecording = true
         lastDecision = "Recorder started"
+        prepareCaptureHaptic()
     }
 
     func stop() {
@@ -118,6 +120,7 @@ final class SceneCaptureRecorder {
             lastSavedTimestamp = frame.timestamp
             lastSavedTransform = frame.camera.transform
             lastDecision = "Saved \(imageName)"
+            notifyCaptureSaved()
         } catch {
             lastDecision = "Save failed: \(error.localizedDescription)"
         }
@@ -239,6 +242,19 @@ final class SceneCaptureRecorder {
     private func writeMetadata(_ object: [String: Any], to url: URL) throws {
         let jsonData = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try jsonData.write(to: url, options: .atomic)
+    }
+
+    private func prepareCaptureHaptic() {
+        DispatchQueue.main.async { [hapticGenerator] in
+            hapticGenerator.prepare()
+        }
+    }
+
+    private func notifyCaptureSaved() {
+        DispatchQueue.main.async { [hapticGenerator] in
+            hapticGenerator.impactOccurred(intensity: 0.45)
+            hapticGenerator.prepare()
+        }
     }
 }
 
