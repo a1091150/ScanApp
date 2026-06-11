@@ -6,9 +6,8 @@
 //
 
 import ARKit
-import CoreImage
+import AVFoundation
 import Foundation
-import ImageIO
 import simd
 import UIKit
 
@@ -25,7 +24,7 @@ struct SavedSceneCapture {
 final class SceneCaptureRecorder {
     private let writerQueue = DispatchQueue(label: "dokidoki.ScanApp.sceneCaptureWriter", qos: .utility)
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
-    private let jpegQuality: CGFloat = 0.92
+    private let videoFileName = "capture.mp4"
     private let minCaptureInterval: TimeInterval = 0.45
     private let minTranslationDelta: Float = 0.05
     private let minRotationDeltaRadians: Float = 7 * .pi / 180
@@ -34,8 +33,8 @@ final class SceneCaptureRecorder {
     private let maxPendingWrites = 2
 
     private var sessionDirectory: URL?
-    private var imagesDirectory: URL?
     private var metadataDirectory: URL?
+    private var videoURL: URL?
     private var isRecording = false
     private var frameIndex = 0
     private var savedImageCount = 0
@@ -48,6 +47,11 @@ final class SceneCaptureRecorder {
     private var previousFrameTransform: simd_float4x4?
     private var lastDecision = "Recorder idle"
 
+    private var videoWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var firstVideoTimestamp: TimeInterval?
+
     var onCaptureSaved: ((SavedSceneCapture) -> Void)?
 
     var status: SceneCaptureRecorderStatus {
@@ -56,14 +60,14 @@ final class SceneCaptureRecorder {
 
     func start(sessionDirectory: URL) throws {
         self.sessionDirectory = sessionDirectory
-        imagesDirectory = sessionDirectory.appendingPathComponent("images", isDirectory: true)
         metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
+        videoURL = sessionDirectory.appendingPathComponent(videoFileName)
 
-        if let imagesDirectory {
-            try FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
-        }
         if let metadataDirectory {
             try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+        }
+        if let videoURL, FileManager.default.fileExists(atPath: videoURL.path) {
+            try FileManager.default.removeItem(at: videoURL)
         }
 
         isRecording = true
@@ -75,13 +79,14 @@ final class SceneCaptureRecorder {
     func stop() {
         isRecording = false
         lastDecision = "Recorder stopped"
+        finishVideoWriter()
     }
 
     func reset() {
         isRecording = false
         sessionDirectory = nil
-        imagesDirectory = nil
         metadataDirectory = nil
+        videoURL = nil
         frameIndex = 0
         savedImageCount = 0
         pendingWriteCount = 0
@@ -92,13 +97,14 @@ final class SceneCaptureRecorder {
         previousFrameTimestamp = nil
         previousFrameTransform = nil
         lastDecision = "Recorder reset"
+        finishVideoWriter()
     }
 
     func process(frame: ARFrame, interfaceOrientation: UIInterfaceOrientation) {
         frameIndex += 1
 
         guard isRecording else { return }
-        guard let imagesDirectory, let metadataDirectory else {
+        guard let metadataDirectory, let videoURL else {
             lastDecision = "Missing dataset directory"
             return
         }
@@ -114,47 +120,58 @@ final class SceneCaptureRecorder {
             return
         }
 
-        do {
-            guard pendingWriteCount < maxPendingWrites else {
-                lastDecision = "Skipped: writer queue busy"
-                return
-            }
-
-            let frameName = String(format: "frame_%06d", frameIndex)
-            let imageName = "\(frameName).jpg"
-            let metadataName = "\(frameName).json"
-            let imageURL = imagesDirectory.appendingPathComponent(imageName)
-            let metadataURL = metadataDirectory.appendingPathComponent(metadataName)
-
-            let metadata = makeMetadata(
-                frame: frame,
-                imageRelativePath: "images/\(imageName)",
-                metadataRelativePath: "metadata/\(metadataName)",
-                interfaceOrientation: interfaceOrientation,
-                motion: motion
-            )
-            let metadataData = try makeMetadataData(metadata)
-            let pixelBuffer = frame.capturedImage
-            let cameraTransform = frame.camera.transform
-
-            pendingWriteCount += 1
-            acceptedCaptureCount += 1
-            lastSavedTimestamp = frame.timestamp
-            lastSavedTransform = frame.camera.transform
-            lastDecision = "Queued \(imageName)"
-
-            enqueueCaptureWrite(
-                pixelBuffer: pixelBuffer,
-                imageURL: imageURL,
-                metadataData: metadataData,
-                metadataURL: metadataURL,
-                imageName: imageName,
-                cameraTransform: cameraTransform,
-                generation: recordingGeneration
-            )
-        } catch {
-            lastDecision = "Save failed: \(error.localizedDescription)"
+        guard pendingWriteCount < maxPendingWrites else {
+            lastDecision = "Skipped: writer queue busy"
+            return
         }
+
+        let captureIndex = acceptedCaptureCount
+        let frameName = String(format: "frame_%06d", frameIndex)
+        let metadataName = "\(frameName).json"
+        let metadataURL = metadataDirectory.appendingPathComponent(metadataName)
+        let pixelBuffer = frame.capturedImage
+        let camera = frame.camera
+        let cameraTransform = camera.transform
+        let worldToCamera = cameraTransform.inverse
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let projection = camera.projectionMatrix(
+            for: .landscapeRight,
+            viewportSize: CGSize(width: CGFloat(width), height: CGFloat(height)),
+            zNear: 0.001,
+            zFar: 100
+        )
+
+        let snapshot = SceneCaptureFrameSnapshot(
+            pixelBuffer: pixelBuffer,
+            videoURL: videoURL,
+            videoRelativePath: videoFileName,
+            videoFrameIndex: captureIndex,
+            frameIndex: frameIndex,
+            frameName: frameName,
+            metadataRelativePath: "metadata/\(metadataName)",
+            metadataURL: metadataURL,
+            timestamp: frame.timestamp,
+            width: width,
+            height: height,
+            interfaceOrientationName: interfaceOrientation.metadataName,
+            intrinsics: camera.intrinsics,
+            cameraTransform: cameraTransform,
+            worldToCamera: worldToCamera,
+            projectionMatrix: projection,
+            exposureDuration: camera.exposureDuration,
+            exposureOffset: camera.exposureOffset,
+            motion: motion,
+            trackingStateText: trackingText(for: camera.trackingState)
+        )
+
+        pendingWriteCount += 1
+        acceptedCaptureCount += 1
+        lastSavedTimestamp = frame.timestamp
+        lastSavedTransform = cameraTransform
+        lastDecision = "Queued \(frameName)"
+
+        enqueueCaptureWrite(snapshot: snapshot, generation: recordingGeneration)
     }
 
     private func shouldCapture(frame: ARFrame, motion: FrameMotion) -> (shouldCapture: Bool, reason: String) {
@@ -213,83 +230,119 @@ final class SceneCaptureRecorder {
         )
     }
 
-    private func makeMetadata(
-        frame: ARFrame,
-        imageRelativePath: String,
-        metadataRelativePath: String,
-        interfaceOrientation: UIInterfaceOrientation,
-        motion: FrameMotion
-    ) -> [String: Any] {
-        let camera = frame.camera
-        let capturedImage = frame.capturedImage
-        let cameraToWorld = camera.transform
-        let worldToCamera = cameraToWorld.inverse
-        let projection = camera.projectionMatrix(
-            for: .landscapeRight,
-            viewportSize: CGSize(width: CGFloat(CVPixelBufferGetWidth(capturedImage)), height: CGFloat(CVPixelBufferGetHeight(capturedImage))),
-            zNear: 0.001,
-            zFar: 100
-        )
-
-        return [
-            "frame_index": frameIndex,
-            "time": frame.timestamp,
-            "image": imageRelativePath,
-            "metadata": metadataRelativePath,
-            "image_orientation": "landscapeRight",
-            "projection_orientation": "landscapeRight",
-            "required_orientation": "landscapeRight",
-            "ui_orientation": interfaceOrientation.metadataName,
-            "width": CVPixelBufferGetWidth(capturedImage),
-            "height": CVPixelBufferGetHeight(capturedImage),
-            "intrinsics": flatten3x3(camera.intrinsics),
-            "camera_to_world": flatten4x4(cameraToWorld),
-            "world_to_camera": flatten4x4(worldToCamera),
-            "projectionMatrix": flatten4x4(projection),
-            "exposureDuration": camera.exposureDuration,
-            "exposureOffset": camera.exposureOffset,
-            "averageVelocity": motion.velocity,
-            "averageAngularVelocity": motion.angularVelocity,
-            "motionQuality": motion.motionQuality,
-            "trackingState": trackingText(for: camera.trackingState)
-        ]
-    }
-
-    private func makeMetadataData(_ object: [String: Any]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-    }
-
-    private func enqueueCaptureWrite(
-        pixelBuffer: CVPixelBuffer,
-        imageURL: URL,
-        metadataData: Data,
-        metadataURL: URL,
-        imageName: String,
-        cameraTransform: simd_float4x4,
-        generation: Int
-    ) {
-        let jpegQuality = jpegQuality
-
+    private func enqueueCaptureWrite(snapshot: SceneCaptureFrameSnapshot, generation: Int) {
         writerQueue.async { [weak self] in
             let result = Result<Void, Error> {
-                try writeJPEG(pixelBuffer: pixelBuffer, to: imageURL, jpegQuality: jpegQuality)
-                try metadataData.write(to: metadataURL, options: .atomic)
+                try self?.appendVideoFrameAndWriteMetadata(snapshot)
             }
 
             DispatchQueue.main.async {
                 self?.finishCaptureWrite(
                     result,
-                    imageName: imageName,
-                    cameraTransform: cameraTransform,
+                    frameName: snapshot.frameName,
+                    cameraTransform: snapshot.cameraTransform,
                     generation: generation
                 )
             }
         }
     }
 
+    private func appendVideoFrameAndWriteMetadata(_ snapshot: SceneCaptureFrameSnapshot) throws {
+        try ensureVideoWriter(for: snapshot)
+
+        guard let videoInput, let pixelBufferAdaptor else {
+            throw SceneCaptureRecorderError.videoWriterUnavailable
+        }
+        guard videoInput.isReadyForMoreMediaData else {
+            throw SceneCaptureRecorderError.videoInputNotReady
+        }
+        guard let firstVideoTimestamp else {
+            throw SceneCaptureRecorderError.videoWriterUnavailable
+        }
+
+        let presentationTime = CMTime(
+            seconds: max(0, snapshot.timestamp - firstVideoTimestamp),
+            preferredTimescale: 600
+        )
+
+        guard pixelBufferAdaptor.append(snapshot.pixelBuffer, withPresentationTime: presentationTime) else {
+            throw videoWriter?.error ?? SceneCaptureRecorderError.videoAppendFailed
+        }
+
+        let metadata = makeMetadata(from: snapshot)
+        let metadataData = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+        try metadataData.write(to: snapshot.metadataURL, options: .atomic)
+    }
+
+    private func ensureVideoWriter(for snapshot: SceneCaptureFrameSnapshot) throws {
+        if videoWriter != nil { return }
+
+        let writer = try AVAssetWriter(outputURL: snapshot.videoURL, fileType: .mp4)
+        let outputSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: snapshot.width,
+            AVVideoHeightKey: snapshot.height
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+        input.expectsMediaDataInRealTime = true
+
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: CVPixelBufferGetPixelFormatType(snapshot.pixelBuffer),
+            kCVPixelBufferWidthKey as String: snapshot.width,
+            kCVPixelBufferHeightKey as String: snapshot.height
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: attributes
+        )
+
+        guard writer.canAdd(input) else {
+            throw SceneCaptureRecorderError.videoWriterUnavailable
+        }
+
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw writer.error ?? SceneCaptureRecorderError.videoWriterUnavailable
+        }
+
+        firstVideoTimestamp = snapshot.timestamp
+        writer.startSession(atSourceTime: .zero)
+        videoWriter = writer
+        videoInput = input
+        pixelBufferAdaptor = adaptor
+    }
+
+    private func makeMetadata(from snapshot: SceneCaptureFrameSnapshot) -> [String: Any] {
+        [
+            "frame_index": snapshot.frameIndex,
+            "frame_name": snapshot.frameName,
+            "time": snapshot.timestamp,
+            "video": snapshot.videoRelativePath,
+            "video_frame_index": snapshot.videoFrameIndex,
+            "metadata": snapshot.metadataRelativePath,
+            "derived_image": "images/\(snapshot.frameName).jpg",
+            "image_orientation": "landscapeRight",
+            "projection_orientation": "landscapeRight",
+            "required_orientation": "landscapeRight",
+            "ui_orientation": snapshot.interfaceOrientationName,
+            "width": snapshot.width,
+            "height": snapshot.height,
+            "intrinsics": flatten3x3(snapshot.intrinsics),
+            "camera_to_world": flatten4x4(snapshot.cameraTransform),
+            "world_to_camera": flatten4x4(snapshot.worldToCamera),
+            "projectionMatrix": flatten4x4(snapshot.projectionMatrix),
+            "exposureDuration": snapshot.exposureDuration,
+            "exposureOffset": snapshot.exposureOffset,
+            "averageVelocity": snapshot.motion.velocity,
+            "averageAngularVelocity": snapshot.motion.angularVelocity,
+            "motionQuality": snapshot.motion.motionQuality,
+            "trackingState": snapshot.trackingStateText
+        ]
+    }
+
     private func finishCaptureWrite(
         _ result: Result<Void, Error>,
-        imageName: String,
+        frameName: String,
         cameraTransform: simd_float4x4,
         generation: Int
     ) {
@@ -300,11 +353,23 @@ final class SceneCaptureRecorder {
         switch result {
         case .success:
             savedImageCount += 1
-            lastDecision = "Saved \(imageName)"
+            lastDecision = "Saved \(frameName)"
             notifyCaptureSaved()
-            onCaptureSaved?(SavedSceneCapture(imageName: imageName, cameraTransform: cameraTransform))
+            onCaptureSaved?(SavedSceneCapture(imageName: frameName, cameraTransform: cameraTransform))
         case .failure(let error):
             lastDecision = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishVideoWriter() {
+        writerQueue.async { [weak self] in
+            guard let self, let writer = self.videoWriter else { return }
+            self.videoInput?.markAsFinished()
+            writer.finishWriting { }
+            self.videoWriter = nil
+            self.videoInput = nil
+            self.pixelBufferAdaptor = nil
+            self.firstVideoTimestamp = nil
         }
     }
 
@@ -322,38 +387,48 @@ final class SceneCaptureRecorder {
     }
 }
 
+private struct SceneCaptureFrameSnapshot {
+    let pixelBuffer: CVPixelBuffer
+    let videoURL: URL
+    let videoRelativePath: String
+    let videoFrameIndex: Int
+    let frameIndex: Int
+    let frameName: String
+    let metadataRelativePath: String
+    let metadataURL: URL
+    let timestamp: TimeInterval
+    let width: Int
+    let height: Int
+    let interfaceOrientationName: String
+    let intrinsics: simd_float3x3
+    let cameraTransform: simd_float4x4
+    let worldToCamera: simd_float4x4
+    let projectionMatrix: simd_float4x4
+    let exposureDuration: TimeInterval
+    let exposureOffset: Float
+    let motion: FrameMotion
+    let trackingStateText: String
+}
+
 private struct FrameMotion {
     let velocity: Float
     let angularVelocity: Float
     let motionQuality: Float
 }
 
-private func writeJPEG(pixelBuffer: CVPixelBuffer, to url: URL, jpegQuality: CGFloat) throws {
-    let image = CIImage(cvPixelBuffer: pixelBuffer)
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
-    let context = CIContext()
-
-    guard let data = context.jpegRepresentation(
-        of: image,
-        colorSpace: colorSpace,
-        options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegQuality]
-    ) else {
-        throw SceneCaptureRecorderError.jpegEncodingFailed
-    }
-
-    try data.write(to: url, options: .atomic)
-}
-
 private enum SceneCaptureRecorderError: LocalizedError {
-    case jpegEncodingFailed
-    case metadataEncodingFailed
+    case videoWriterUnavailable
+    case videoInputNotReady
+    case videoAppendFailed
 
     var errorDescription: String? {
         switch self {
-        case .jpegEncodingFailed:
-            return "Could not encode the AR camera image as JPEG."
-        case .metadataEncodingFailed:
-            return "Could not encode frame metadata."
+        case .videoWriterUnavailable:
+            return "Could not create the video writer."
+        case .videoInputNotReady:
+            return "The video writer is not ready for another frame."
+        case .videoAppendFailed:
+            return "Could not append the AR camera frame to the video."
         }
     }
 }

@@ -13,6 +13,9 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private let arView = ARView(frame: .zero)
     private let meshStore = SceneMeshStore()
     private let captureRecorder = SceneCaptureRecorder()
+    private let cameraMarkerBeamMesh = MeshResource.generateBox(size: 1)
+    private let cameraMarkerMaterial = SimpleMaterial(color: UIColor.systemYellow.withAlphaComponent(0.85), isMetallic: false)
+    private let cameraForwardMaterial = SimpleMaterial(color: UIColor.systemCyan.withAlphaComponent(0.85), isMetallic: false)
 
     private let statusPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
     private let stackView = UIStackView()
@@ -360,8 +363,9 @@ final class SceneReconstructionScannerViewController: UIViewController {
             "projection_orientation": "landscapeRight",
             "required_orientation": "landscapeRight",
             "dataset_layout": [
-                "images": "images/frame_000001.jpg",
-                "metadata": "metadata/frame_000001.json"
+                "video": "capture.mp4",
+                "metadata": "metadata/frame_000001.json",
+                "derived_images": "images/frame_000001.jpg"
             ]
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
@@ -383,7 +387,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         worldPointCountLabel.text = "World points: \(meshStore.vertexCount)"
         depthLabel.text = depthStatus
         confidenceLabel.text = confidenceStatus
-        imageCaptureLabel.text = "Saved images: \(recorderStatus.savedImageCount)"
+        imageCaptureLabel.text = "Saved video frames: \(recorderStatus.savedImageCount)"
         imageDecisionLabel.text = "Image recorder: \(recorderStatus.lastDecision)"
     }
 
@@ -435,28 +439,47 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
     private func addCameraMarker(for capture: SavedSceneCapture) {
         let anchor = AnchorEntity(world: capture.cameraTransform)
-        let originMaterial = SimpleMaterial(color: .white, isMetallic: false)
-        let forwardMaterial = SimpleMaterial(color: .systemBlue, isMetallic: false)
-        let rightMaterial = SimpleMaterial(color: .systemRed, isMetallic: false)
-        let upMaterial = SimpleMaterial(color: .systemGreen, isMetallic: false)
+        let center = SIMD3<Float>(0, 0, 0)
+        let markerScale: Float = 0.05
+        let nearZ: Float = -0.16 * markerScale
+        let halfWidth: Float = 0.105 * markerScale
+        let halfHeight: Float = 0.07 * markerScale
+        let topLeft = SIMD3<Float>(-halfWidth, halfHeight, nearZ)
+        let topRight = SIMD3<Float>(halfWidth, halfHeight, nearZ)
+        let bottomLeft = SIMD3<Float>(-halfWidth, -halfHeight, nearZ)
+        let bottomRight = SIMD3<Float>(halfWidth, -halfHeight, nearZ)
+        let forwardTip = SIMD3<Float>(0, 0, -0.28 * markerScale)
 
-        let origin = ModelEntity(mesh: .generateSphere(radius: 0.018), materials: [originMaterial])
-        let forward = ModelEntity(mesh: .generateSphere(radius: 0.012), materials: [forwardMaterial])
-        let right = ModelEntity(mesh: .generateSphere(radius: 0.009), materials: [rightMaterial])
-        let up = ModelEntity(mesh: .generateSphere(radius: 0.009), materials: [upMaterial])
-
-        forward.position = SIMD3<Float>(0, 0, -0.11)
-        right.position = SIMD3<Float>(0.07, 0, 0)
-        up.position = SIMD3<Float>(0, 0.07, 0)
+        [
+            makeCameraMarkerBeam(from: center, to: topLeft, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: center, to: topRight, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: center, to: bottomLeft, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: center, to: bottomRight, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: topLeft, to: topRight, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: topRight, to: bottomRight, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: bottomRight, to: bottomLeft, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: bottomLeft, to: topLeft, material: cameraMarkerMaterial),
+            makeCameraMarkerBeam(from: center, to: forwardTip, thickness: 0.008 * markerScale, material: cameraForwardMaterial)
+        ].forEach { anchor.addChild($0) }
 
         anchor.name = "saved_camera_\(capture.imageName)"
-        anchor.addChild(origin)
-        anchor.addChild(forward)
-        anchor.addChild(right)
-        anchor.addChild(up)
-
         arView.scene.addAnchor(anchor)
         cameraMarkerAnchors.append(anchor)
+    }
+
+    private func makeCameraMarkerBeam(
+        from start: SIMD3<Float>,
+        to end: SIMD3<Float>,
+        thickness: Float = 0.0002,
+        material: SimpleMaterial
+    ) -> ModelEntity {
+        let delta = end - start
+        let length = simd_length(delta)
+        let entity = ModelEntity(mesh: cameraMarkerBeamMesh, materials: [material])
+        entity.position = (start + end) * 0.5
+        entity.scale = SIMD3<Float>(thickness, thickness, max(length, 0.001))
+        entity.orientation = simd_quatf(from: SIMD3<Float>(0, 0, 1), to: simd_normalize(delta))
+        return entity
     }
 
     private func removeCameraMarkers() {
