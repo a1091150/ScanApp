@@ -14,6 +14,7 @@ import UIKit
 
 struct SceneCaptureRecorderStatus {
     let savedImageCount: Int
+    let savedDepthFrameCount: Int
     let lastDecision: String
 }
 
@@ -39,10 +40,13 @@ final class SceneCaptureRecorder {
     private var sessionDirectory: URL?
     private var imageDirectory: URL?
     private var metadataDirectory: URL?
+    private var depthDirectory: URL?
     private var videoURL: URL?
     private var isRecording = false
+    private var isRecordingDepth = false
     private var frameIndex = 0
     private var savedImageCount = 0
+    private var savedDepthFrameCount = 0
     private var pendingWriteCount = 0
     private var acceptedCaptureCount = 0
     private var recordingGeneration = 0
@@ -60,13 +64,20 @@ final class SceneCaptureRecorder {
     var onCaptureSaved: ((SavedSceneCapture) -> Void)?
 
     var status: SceneCaptureRecorderStatus {
-        SceneCaptureRecorderStatus(savedImageCount: savedImageCount, lastDecision: lastDecision)
+        SceneCaptureRecorderStatus(
+            savedImageCount: savedImageCount,
+            savedDepthFrameCount: savedDepthFrameCount,
+            lastDecision: lastDecision
+        )
     }
 
-    func start(sessionDirectory: URL) throws {
+    func start(sessionDirectory: URL, recordsDepthData: Bool = false) throws {
         self.sessionDirectory = sessionDirectory
         imageDirectory = sessionDirectory.appendingPathComponent("images", isDirectory: true)
         metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
+        depthDirectory = recordsDepthData
+            ? sessionDirectory.appendingPathComponent("depth", isDirectory: true)
+            : nil
         videoURL = sessionDirectory.appendingPathComponent(videoFileName)
 
         if let imageDirectory {
@@ -75,18 +86,23 @@ final class SceneCaptureRecorder {
         if let metadataDirectory {
             try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
         }
+        if let depthDirectory {
+            try FileManager.default.createDirectory(at: depthDirectory, withIntermediateDirectories: true)
+        }
         if outputMode == .video, let videoURL, FileManager.default.fileExists(atPath: videoURL.path) {
             try FileManager.default.removeItem(at: videoURL)
         }
 
         isRecording = true
+        isRecordingDepth = recordsDepthData
         recordingGeneration += 1
-        lastDecision = "Recorder started"
+        lastDecision = recordsDepthData ? "Recorder started + depth" : "Recorder started"
         prepareCaptureHaptic()
     }
 
     func stop() {
         isRecording = false
+        isRecordingDepth = false
         lastDecision = "Recorder stopped"
         finishVideoWriter()
     }
@@ -96,9 +112,12 @@ final class SceneCaptureRecorder {
         sessionDirectory = nil
         imageDirectory = nil
         metadataDirectory = nil
+        depthDirectory = nil
         videoURL = nil
+        isRecordingDepth = false
         frameIndex = 0
         savedImageCount = 0
+        savedDepthFrameCount = 0
         pendingWriteCount = 0
         acceptedCaptureCount = 0
         recordingGeneration += 1
@@ -141,6 +160,7 @@ final class SceneCaptureRecorder {
         let metadataName = "\(frameName).json"
         let imageURL = imageDirectory.appendingPathComponent(imageName)
         let metadataURL = metadataDirectory.appendingPathComponent(metadataName)
+        let depthSnapshot = makeDepthSnapshot(from: frame, frameName: frameName)
         let pixelBuffer = frame.capturedImage
         let camera = frame.camera
         let cameraTransform = camera.transform
@@ -177,7 +197,8 @@ final class SceneCaptureRecorder {
             exposureDuration: camera.exposureDuration,
             exposureOffset: camera.exposureOffset,
             motion: motion,
-            trackingStateText: trackingText(for: camera.trackingState)
+            trackingStateText: trackingText(for: camera.trackingState),
+            depthSnapshot: depthSnapshot
         )
 
         pendingWriteCount += 1
@@ -256,7 +277,8 @@ final class SceneCaptureRecorder {
                     result,
                     frameName: snapshot.frameName,
                     cameraTransform: snapshot.cameraTransform,
-                    generation: generation
+                    generation: generation,
+                    hasDepthSnapshot: snapshot.depthSnapshot != nil
                 )
             }
         }
@@ -282,6 +304,7 @@ final class SceneCaptureRecorder {
         )
 
         let metadata = makeMetadata(from: snapshot)
+        try writeDepthDataIfNeeded(snapshot.depthSnapshot)
         let metadataData = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try metadataData.write(to: snapshot.metadataURL, options: .atomic)
     }
@@ -312,6 +335,7 @@ final class SceneCaptureRecorder {
         }
 
         let metadata = makeMetadata(from: snapshot)
+        try writeDepthDataIfNeeded(snapshot.depthSnapshot)
         let metadataData = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try metadataData.write(to: snapshot.metadataURL, options: .atomic)
     }
@@ -390,14 +414,59 @@ final class SceneCaptureRecorder {
             metadata["derived_image"] = snapshot.imageRelativePath
         }
 
+        if let depthSnapshot = snapshot.depthSnapshot {
+            var depthMetadata: [String: Any] = [
+                "format": "float32_little_endian",
+                "path": depthSnapshot.depthRelativePath,
+                "width": depthSnapshot.width,
+                "height": depthSnapshot.height,
+                "bytes_per_value": MemoryLayout<Float>.size
+            ]
+            if let confidenceRelativePath = depthSnapshot.confidenceRelativePath {
+                depthMetadata["confidence_path"] = confidenceRelativePath
+                depthMetadata["confidence_format"] = "uint8"
+            }
+            metadata["depth"] = depthMetadata
+        }
+
         return metadata
+    }
+
+    private func makeDepthSnapshot(from frame: ARFrame, frameName: String) -> SceneDepthFrameSnapshot? {
+        guard isRecordingDepth, let depthDirectory else { return nil }
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+
+        let depthMap = depthData.depthMap
+        let depthName = "\(frameName)_depth_f32.bin"
+        let confidenceName = "\(frameName)_confidence_u8.bin"
+        let confidenceMap = depthData.confidenceMap
+
+        return SceneDepthFrameSnapshot(
+            depthMap: depthMap,
+            confidenceMap: confidenceMap,
+            depthURL: depthDirectory.appendingPathComponent(depthName),
+            depthRelativePath: "depth/\(depthName)",
+            confidenceURL: confidenceMap == nil ? nil : depthDirectory.appendingPathComponent(confidenceName),
+            confidenceRelativePath: confidenceMap == nil ? nil : "depth/\(confidenceName)",
+            width: CVPixelBufferGetWidth(depthMap),
+            height: CVPixelBufferGetHeight(depthMap)
+        )
+    }
+
+    private func writeDepthDataIfNeeded(_ snapshot: SceneDepthFrameSnapshot?) throws {
+        guard let snapshot else { return }
+        try writeFloat32PixelBuffer(snapshot.depthMap, to: snapshot.depthURL)
+        if let confidenceMap = snapshot.confidenceMap, let confidenceURL = snapshot.confidenceURL {
+            try writeUInt8PixelBuffer(confidenceMap, to: confidenceURL)
+        }
     }
 
     private func finishCaptureWrite(
         _ result: Result<Void, Error>,
         frameName: String,
         cameraTransform: simd_float4x4,
-        generation: Int
+        generation: Int,
+        hasDepthSnapshot: Bool
     ) {
         guard generation == recordingGeneration else { return }
 
@@ -406,6 +475,9 @@ final class SceneCaptureRecorder {
         switch result {
         case .success:
             savedImageCount += 1
+            if hasDepthSnapshot {
+                savedDepthFrameCount += 1
+            }
             lastDecision = "Saved \(frameName)"
             notifyCaptureSaved()
             onCaptureSaved?(SavedSceneCapture(imageName: frameName, cameraTransform: cameraTransform))
@@ -464,6 +536,18 @@ private struct SceneCaptureFrameSnapshot {
     let exposureOffset: Float
     let motion: FrameMotion
     let trackingStateText: String
+    let depthSnapshot: SceneDepthFrameSnapshot?
+}
+
+private struct SceneDepthFrameSnapshot {
+    let depthMap: CVPixelBuffer
+    let confidenceMap: CVPixelBuffer?
+    let depthURL: URL
+    let depthRelativePath: String
+    let confidenceURL: URL?
+    let confidenceRelativePath: String?
+    let width: Int
+    let height: Int
 }
 
 private enum SceneCaptureOutputMode: String {
@@ -481,6 +565,9 @@ private enum SceneCaptureRecorderError: LocalizedError {
     case videoWriterUnavailable
     case videoInputNotReady
     case videoAppendFailed
+    case pixelBufferBaseAddressUnavailable
+    case unsupportedDepthPixelFormat(OSType)
+    case unsupportedConfidencePixelFormat(OSType)
 
     var errorDescription: String? {
         switch self {
@@ -490,8 +577,69 @@ private enum SceneCaptureRecorderError: LocalizedError {
             return "The video writer is not ready for another frame."
         case .videoAppendFailed:
             return "Could not append the AR camera frame to the video."
+        case .pixelBufferBaseAddressUnavailable:
+            return "Could not read the depth pixel buffer."
+        case .unsupportedDepthPixelFormat(let pixelFormat):
+            return "Unsupported depth pixel format: \(pixelFormat)."
+        case .unsupportedConfidencePixelFormat(let pixelFormat):
+            return "Unsupported confidence pixel format: \(pixelFormat)."
         }
     }
+}
+
+func writeFloat32PixelBuffer(_ pixelBuffer: CVPixelBuffer, to url: URL) throws {
+    let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+    guard pixelFormat == kCVPixelFormatType_DepthFloat32 || pixelFormat == kCVPixelFormatType_DisparityFloat32 else {
+        throw SceneCaptureRecorderError.unsupportedDepthPixelFormat(pixelFormat)
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw SceneCaptureRecorderError.pixelBufferBaseAddressUnavailable
+    }
+
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    let rowByteCount = width * MemoryLayout<Float>.size
+    var data = Data()
+    data.reserveCapacity(rowByteCount * height)
+
+    for row in 0..<height {
+        let rowStart = baseAddress.advanced(by: row * bytesPerRow)
+        data.append(contentsOf: UnsafeRawBufferPointer(start: rowStart, count: rowByteCount))
+    }
+
+    try data.write(to: url, options: .atomic)
+}
+
+private func writeUInt8PixelBuffer(_ pixelBuffer: CVPixelBuffer, to url: URL) throws {
+    let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+    guard pixelFormat == kCVPixelFormatType_OneComponent8 else {
+        throw SceneCaptureRecorderError.unsupportedConfidencePixelFormat(pixelFormat)
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw SceneCaptureRecorderError.pixelBufferBaseAddressUnavailable
+    }
+
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    var data = Data()
+    data.reserveCapacity(width * height)
+
+    for row in 0..<height {
+        let rowStart = baseAddress.advanced(by: row * bytesPerRow)
+        data.append(contentsOf: UnsafeRawBufferPointer(start: rowStart, count: width))
+    }
+
+    try data.write(to: url, options: .atomic)
 }
 
 private func flatten3x3(_ matrix: simd_float3x3) -> [Float] {

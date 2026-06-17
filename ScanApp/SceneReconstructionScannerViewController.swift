@@ -10,6 +10,7 @@ import RealityKit
 import UIKit
 
 final class SceneReconstructionScannerViewController: UIViewController {
+    private let recordsDepthData: Bool
     private let arView = ARView(frame: .zero)
     private let meshStore = SceneMeshStore()
     private let captureRecorder = SceneCaptureRecorder()
@@ -39,6 +40,16 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private var confidenceStatus = "Confidence: unavailable"
     private var scanTimestamp: String?
     private var scanDirectory: URL?
+
+    init(recordsDepthData: Bool = false) {
+        self.recordsDepthData = recordsDepthData
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         .landscapeRight
@@ -253,7 +264,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
         do {
             let directory = try currentScanDirectory()
-            try captureRecorder.start(sessionDirectory: directory)
+            try captureRecorder.start(sessionDirectory: directory, recordsDepthData: recordsDepthData)
             isRecordingImages = true
             arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
             isScanning = true
@@ -343,18 +354,25 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
     private func writeSessionMetadata(to directory: URL, timestamp: String) throws {
         let metadataURL = directory.appendingPathComponent("session.json")
+        var datasetLayout: [String: Any] = [
+            "images": "images/frame_000001.jpg",
+            "metadata": "metadata/frame_000001.json",
+            "video": "capture.mp4",
+            "video_enabled": false
+        ]
+        if recordsDepthData {
+            datasetLayout["depth"] = "depth/frame_000001_depth_f32.bin"
+            datasetLayout["confidence"] = "depth/frame_000001_confidence_u8.bin"
+        }
+
         let metadata: [String: Any] = [
             "session_id": timestamp,
             "created_at": ISO8601DateFormatter().string(from: Date()),
             "image_orientation": "landscapeRight",
             "projection_orientation": "landscapeRight",
             "required_orientation": "landscapeRight",
-            "dataset_layout": [
-                "images": "images/frame_000001.jpg",
-                "metadata": "metadata/frame_000001.json",
-                "video": "capture.mp4",
-                "video_enabled": false
-            ]
+            "records_depth_data": recordsDepthData,
+            "dataset_layout": datasetLayout
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: metadataURL, options: .atomic)
@@ -375,7 +393,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         worldPointCountLabel.text = "World points: \(meshStore.vertexCount)"
         depthLabel.text = depthStatus
         confidenceLabel.text = confidenceStatus
-        imageCaptureLabel.text = "Saved images: \(recorderStatus.savedImageCount)"
+        imageCaptureLabel.text = "Saved images/depth: \(recorderStatus.savedImageCount) / \(recorderStatus.savedDepthFrameCount)"
         imageDecisionLabel.text = "Image recorder: \(recorderStatus.lastDecision)"
     }
 
