@@ -10,7 +10,7 @@ import UIKit
 class ViewController: UIViewController {
     private let scannerButton: UIButton = {
         let button = UIButton(type: .system)
-        button.setTitle("Scene Reconstruction Scanner", for: .normal)
+        button.setTitle("ARKit Depth Scanner", for: .normal)
         button.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         button.tintColor = .white
         button.backgroundColor = .systemBlue
@@ -19,9 +19,9 @@ class ViewController: UIViewController {
         return button
     }()
 
-    private let avFoundationCaptureButton: UIButton = {
+    private let capturedFilesButton: UIButton = {
         let button = UIButton(type: .system)
-        button.setTitle("AVFoundation LiDAR Capture", for: .normal)
+        button.setTitle("Captured Files", for: .normal)
         button.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         button.tintColor = .white
         button.backgroundColor = .systemTeal
@@ -40,8 +40,8 @@ class ViewController: UIViewController {
     }
 
     private func configureButtons() {
-        scannerButton.addTarget(self, action: #selector(promptForSceneDepthRecording), for: .touchUpInside)
-        avFoundationCaptureButton.addTarget(self, action: #selector(openAVFoundationCapture), for: .touchUpInside)
+        scannerButton.addTarget(self, action: #selector(openScanner), for: .touchUpInside)
+        capturedFilesButton.addTarget(self, action: #selector(openCapturedFiles), for: .touchUpInside)
 
         buttonStack.axis = .vertical
         buttonStack.spacing = 14
@@ -49,7 +49,7 @@ class ViewController: UIViewController {
         buttonStack.distribution = .fillEqually
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.addArrangedSubview(scannerButton)
-        buttonStack.addArrangedSubview(avFoundationCaptureButton)
+        buttonStack.addArrangedSubview(capturedFilesButton)
 
         view.addSubview(buttonStack)
 
@@ -58,33 +58,17 @@ class ViewController: UIViewController {
             buttonStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
             buttonStack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             scannerButton.heightAnchor.constraint(equalToConstant: 52),
-            avFoundationCaptureButton.heightAnchor.constraint(equalToConstant: 52)
+            capturedFilesButton.heightAnchor.constraint(equalToConstant: 52)
         ])
     }
 
-    @objc private func promptForSceneDepthRecording() {
-        let alert = UIAlertController(
-            title: "Save Scene Depth?",
-            message: "Depth will be saved as raw Float32 binary files aligned with captured keyframes.",
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "Save Depth", style: .default) { [weak self] _ in
-            self?.openScanner(recordsDepthData: true)
-        })
-        alert.addAction(UIAlertAction(title: "Images Only", style: .default) { [weak self] _ in
-            self?.openScanner(recordsDepthData: false)
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        present(alert, animated: true)
-    }
-
-    private func openScanner(recordsDepthData: Bool) {
-        let scannerViewController = SceneReconstructionScannerViewController(recordsDepthData: recordsDepthData)
+    @objc private func openScanner() {
+        let scannerViewController = SceneReconstructionScannerViewController()
         open(viewController: scannerViewController)
     }
 
-    @objc private func openAVFoundationCapture() {
-        open(viewController: AVFoundationLiDARCaptureViewController())
+    @objc private func openCapturedFiles() {
+        open(viewController: CapturedFilesViewController())
     }
 
     private func open(viewController: UIViewController) {
