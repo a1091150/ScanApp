@@ -81,20 +81,40 @@ final class CapturePointCloudProcessor {
 
     func loadFirstFrameSummary(session: CapturedScanSession) -> CaptureFrameSummary? {
         guard let frame = try? loadFrames(from: session.url).first else { return nil }
+        let cameraPosition = SIMD3<Float>(
+            frame.cameraToWorld[3],
+            frame.cameraToWorld[7],
+            frame.cameraToWorld[11]
+        )
+        let cameraForward = SIMD3<Float>(
+            -frame.cameraToWorld[2],
+            -frame.cameraToWorld[6],
+            -frame.cameraToWorld[10]
+        )
+        let cameraUp = SIMD3<Float>(
+            frame.cameraToWorld[1],
+            frame.cameraToWorld[5],
+            frame.cameraToWorld[9]
+        )
         return CaptureFrameSummary(
             frameName: frame.frameName,
             imageURL: session.url.appendingPathComponent(frame.imagePath),
             cameraPositionText: String(
                 format: "Camera position: %.3f, %.3f, %.3f",
-                frame.cameraToWorld[3],
-                frame.cameraToWorld[7],
-                frame.cameraToWorld[11]
+                cameraPosition.x,
+                cameraPosition.y,
+                cameraPosition.z
             ),
             cameraForwardText: String(
                 format: "Camera forward: %.3f, %.3f, %.3f",
-                -frame.cameraToWorld[2],
-                -frame.cameraToWorld[6],
-                -frame.cameraToWorld[10]
+                cameraForward.x,
+                cameraForward.y,
+                cameraForward.z
+            ),
+            cameraPose: CaptureCameraPose(
+                position: cameraPosition,
+                forward: cameraForward,
+                up: cameraUp
             )
         )
     }
@@ -646,6 +666,13 @@ struct CaptureFrameSummary {
     let imageURL: URL
     let cameraPositionText: String
     let cameraForwardText: String
+    let cameraPose: CaptureCameraPose
+}
+
+struct CaptureCameraPose {
+    let position: SIMD3<Float>
+    let forward: SIMD3<Float>
+    let up: SIMD3<Float>
 }
 
 private struct CaptureFrameMetadata {

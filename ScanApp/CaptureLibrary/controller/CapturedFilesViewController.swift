@@ -66,7 +66,7 @@ final class CapturedFilesViewController: UITableViewController {
         content.text = session.displayTitle
         content.secondaryText = session.id
         cell.contentConfiguration = content
-        cell.accessoryType = .detailButton
+        cell.accessoryType = .disclosureIndicator
         return cell
     }
 
@@ -75,49 +75,9 @@ final class CapturedFilesViewController: UITableViewController {
         openPreview(for: sessions[indexPath.row])
     }
 
-    override func tableView(
-        _ tableView: UITableView,
-        accessoryButtonTappedForRowWith indexPath: IndexPath
-    ) {
-        showActions(for: sessions[indexPath.row], sourceView: tableView.cellForRow(at: indexPath))
-    }
-
     private func openPreview(for session: CapturedScanSession) {
         let viewController = CapturePreviewViewController(session: session)
         navigationController?.pushViewController(viewController, animated: true)
-    }
-
-    private func showActions(for session: CapturedScanSession, sourceView: UIView?) {
-        let alert = UIAlertController(title: session.displayTitle, message: session.url.lastPathComponent, preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Preview", style: .default) { [weak self] _ in
-            self?.openPreview(for: session)
-        })
-        alert.addAction(UIAlertAction(title: "Share Directory", style: .default) { [weak self] _ in
-            self?.share(session: session, sourceView: sourceView)
-        })
-        alert.addAction(UIAlertAction(title: "Export to Files Directory", style: .default) { [weak self] _ in
-            self?.exportToPublicDirectory(session)
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.popoverPresentationController?.sourceView = sourceView ?? view
-        alert.popoverPresentationController?.sourceRect = sourceView?.bounds ?? view.bounds
-        present(alert, animated: true)
-    }
-
-    private func share(session: CapturedScanSession, sourceView: UIView?) {
-        let activityViewController = UIActivityViewController(activityItems: [session.url], applicationActivities: nil)
-        activityViewController.popoverPresentationController?.sourceView = sourceView ?? view
-        activityViewController.popoverPresentationController?.sourceRect = sourceView?.bounds ?? view.bounds
-        present(activityViewController, animated: true)
-    }
-
-    private func exportToPublicDirectory(_ session: CapturedScanSession) {
-        do {
-            let destination = try library.exportToPublicDocuments(session)
-            showAlert(title: "Exported", message: destination.path)
-        } catch {
-            showAlert(title: "Export Failed", message: error.localizedDescription)
-        }
     }
 
     private func setEmptyMessage(_ message: String) {
