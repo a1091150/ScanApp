@@ -81,6 +81,15 @@ final class CapturePointCloudProcessor {
 
     func loadFirstFrameSummary(session: CapturedScanSession) -> CaptureFrameSummary? {
         guard let frame = try? loadFrames(from: session.url).first else { return nil }
+        return makeFrameSummary(frame: frame, sessionURL: session.url)
+    }
+
+    func loadFrameSummaries(session: CapturedScanSession) -> [CaptureFrameSummary] {
+        guard let frames = try? loadFrames(from: session.url) else { return [] }
+        return frames.map { makeFrameSummary(frame: $0, sessionURL: session.url) }
+    }
+
+    private func makeFrameSummary(frame: CaptureFrameMetadata, sessionURL: URL) -> CaptureFrameSummary {
         let cameraPosition = SIMD3<Float>(
             frame.cameraToWorld[3],
             frame.cameraToWorld[7],
@@ -98,7 +107,7 @@ final class CapturePointCloudProcessor {
         )
         return CaptureFrameSummary(
             frameName: frame.frameName,
-            imageURL: session.url.appendingPathComponent(frame.imagePath),
+            imageURL: sessionURL.appendingPathComponent(frame.imagePath),
             cameraPositionText: String(
                 format: "Camera position: %.3f, %.3f, %.3f",
                 cameraPosition.x,
@@ -294,7 +303,7 @@ final class CapturePointCloudProcessor {
         var vertices: [USDZColoredVertex] = []
         var indices: [UInt32] = []
         vertices.reserveCapacity(points.count * 4)
-        indices.reserveCapacity(points.count * 6)
+        indices.reserveCapacity(points.count * 12)
 
         for point in points {
             let center = SIMD3(point.x, point.y, point.z)
@@ -311,7 +320,9 @@ final class CapturePointCloudProcessor {
             vertices.append(USDZColoredVertex(position: center - rightOffset + upOffset, color: color))
             indices.append(contentsOf: [
                 baseIndex, baseIndex + 1, baseIndex + 2,
-                baseIndex, baseIndex + 2, baseIndex + 3
+                baseIndex, baseIndex + 2, baseIndex + 3,
+                baseIndex + 2, baseIndex + 1, baseIndex,
+                baseIndex + 3, baseIndex + 2, baseIndex
             ])
         }
 

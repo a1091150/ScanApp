@@ -7,6 +7,7 @@
 
 import UIKit
 import RealityKit
+import simd
 
 final class CapturePreviewViewController: UIViewController {
     private let session: CapturedScanSession
@@ -14,6 +15,7 @@ final class CapturePreviewViewController: UIViewController {
 
     private let imageView = UIImageView()
     private let sceneContainerView = UIView()
+    private let framesCollectionView: UICollectionView
     private let metadataLabel = UILabel()
     private let statusLabel = UILabel()
     private let processButton = UIButton(type: .system)
@@ -22,16 +24,26 @@ final class CapturePreviewViewController: UIViewController {
     private var realityView: ARView?
     private var previewAnchor: AnchorEntity?
     private var previewRootEntity: Entity?
+    private var previewContentEntity: Entity?
     private var previewCamera: PerspectiveCamera?
     private var previewScale: Float = 1
     private var previewYaw: Float = 0
     private var previewPitch: Float = 0
     private var previewCameraDistance: Float = 1
-    private var firstFrameCameraPose: CaptureCameraPose?
+    private var previewOriginalCenter: SIMD3<Float> = .zero
+    private var previewRadius: Float = 1
+    private var frameSummaries: [CaptureFrameSummary] = []
+    private var selectedFrameIndex: Int?
     private var shareButton: UIBarButtonItem?
 
     init(session: CapturedScanSession) {
         self.session = session
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .horizontal
+        layout.minimumLineSpacing = 8
+        layout.minimumInteritemSpacing = 8
+        layout.itemSize = CGSize(width: 72, height: 54)
+        framesCollectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -58,6 +70,13 @@ final class CapturePreviewViewController: UIViewController {
         sceneContainerView.backgroundColor = .black
         sceneContainerView.isHidden = true
 
+        framesCollectionView.translatesAutoresizingMaskIntoConstraints = false
+        framesCollectionView.backgroundColor = .clear
+        framesCollectionView.showsHorizontalScrollIndicator = false
+        framesCollectionView.dataSource = self
+        framesCollectionView.delegate = self
+        framesCollectionView.register(CaptureFrameThumbnailCell.self, forCellWithReuseIdentifier: CaptureFrameThumbnailCell.reuseIdentifier)
+
         metadataLabel.translatesAutoresizingMaskIntoConstraints = false
         metadataLabel.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         metadataLabel.numberOfLines = 0
@@ -81,6 +100,7 @@ final class CapturePreviewViewController: UIViewController {
 
         view.addSubview(imageView)
         view.addSubview(sceneContainerView)
+        view.addSubview(framesCollectionView)
         view.addSubview(metadataLabel)
         view.addSubview(processButton)
         view.addSubview(statusLabel)
@@ -101,9 +121,14 @@ final class CapturePreviewViewController: UIViewController {
             statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 130),
             statusLabel.heightAnchor.constraint(equalToConstant: 30),
 
+            framesCollectionView.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
+            framesCollectionView.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
+            framesCollectionView.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 10),
+            framesCollectionView.heightAnchor.constraint(equalToConstant: 62),
+
             metadataLabel.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
             metadataLabel.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            metadataLabel.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 14),
+            metadataLabel.topAnchor.constraint(equalTo: framesCollectionView.bottomAnchor, constant: 12),
 
             processButton.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
             processButton.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
@@ -127,12 +152,15 @@ final class CapturePreviewViewController: UIViewController {
 
     private func loadSummary() {
         latestResult = nil
-        firstFrameCameraPose = nil
+        selectedFrameIndex = nil
+        frameSummaries = processor.loadFrameSummaries(session: session)
+        framesCollectionView.reloadData()
+        framesCollectionView.isHidden = frameSummaries.isEmpty
         hideUSDZPreview()
 
         let existingUSDZURL = findExistingUSDZURL()
 
-        guard let summary = processor.loadFirstFrameSummary(session: session) else {
+        guard let summary = frameSummaries.first else {
             if let existingUSDZURL {
                 metadataLabel.text = [
                     "Preview: USDZ",
@@ -148,8 +176,7 @@ final class CapturePreviewViewController: UIViewController {
             return
         }
 
-        firstFrameCameraPose = summary.cameraPose
-        imageView.image = UIImage(contentsOfFile: summary.imageURL.path)
+        selectFrame(at: 0, updateRealityCamera: false)
         let previewText: String
         if let existingUSDZURL {
             previewText = "Preview: USDZ\nOutput: \(existingUSDZURL.lastPathComponent)"
@@ -167,6 +194,40 @@ final class CapturePreviewViewController: UIViewController {
         if let existingUSDZURL {
             showUSDZPreview(url: existingUSDZURL)
         }
+    }
+
+    private func selectFrame(at index: Int, updateRealityCamera: Bool = true) {
+        guard frameSummaries.indices.contains(index) else { return }
+
+        selectedFrameIndex = index
+        let summary = frameSummaries[index]
+        if sceneContainerView.isHidden {
+            imageView.image = UIImage(contentsOfFile: summary.imageURL.path)
+        }
+        framesCollectionView.selectItem(
+            at: IndexPath(item: index, section: 0),
+            animated: true,
+            scrollPosition: .centeredHorizontally
+        )
+
+        metadataLabel.text = [
+            "Frame: \(summary.frameName)",
+            summary.cameraPositionText,
+            summary.cameraForwardText,
+            "Session: \(session.id)",
+            previewModeText()
+        ].joined(separator: "\n")
+
+        if updateRealityCamera {
+            movePreviewCamera(to: summary.cameraPose)
+        }
+    }
+
+    private func previewModeText() -> String {
+        if let usdzURL = findExistingUSDZURL() {
+            return "Preview: USDZ\nOutput: \(usdzURL.lastPathComponent)"
+        }
+        return "Preview: image"
     }
 
     @objc private func processPointCloud() {
@@ -275,6 +336,7 @@ final class CapturePreviewViewController: UIViewController {
         previewAnchor.map { realityView?.scene.removeAnchor($0) }
         previewAnchor = nil
         previewRootEntity = nil
+        previewContentEntity = nil
         previewCamera = nil
         imageView.isHidden = false
         sceneContainerView.isHidden = true
@@ -319,6 +381,8 @@ final class CapturePreviewViewController: UIViewController {
 
         let originalCenter = centerEntity(entity)
         let radius = max(entity.visualBounds(recursive: true, relativeTo: root).boundingRadius, 0.1)
+        previewOriginalCenter = originalCenter
+        previewRadius = radius
         previewScale = 1 / radius
         previewYaw = 0
         previewPitch = 0
@@ -327,12 +391,7 @@ final class CapturePreviewViewController: UIViewController {
 
         let camera = PerspectiveCamera()
         camera.camera.fieldOfViewInDegrees = 55
-        configurePreviewCamera(
-            camera,
-            originalCenter: originalCenter,
-            radius: radius,
-            relativeTo: anchor
-        )
+        configureDefaultPreviewCamera(camera, relativeTo: anchor)
         anchor.addChild(camera)
 
         let light = DirectionalLight()
@@ -343,6 +402,7 @@ final class CapturePreviewViewController: UIViewController {
         realityView.scene.addAnchor(anchor)
         previewAnchor = anchor
         previewRootEntity = root
+        previewContentEntity = entity
         previewCamera = camera
     }
 
@@ -354,16 +414,23 @@ final class CapturePreviewViewController: UIViewController {
         return bounds.center
     }
 
-    private func configurePreviewCamera(
+    private func configureDefaultPreviewCamera(
         _ camera: PerspectiveCamera,
-        originalCenter: SIMD3<Float>,
-        radius: Float,
         relativeTo anchor: AnchorEntity
     ) {
-        guard
-            let pose = firstFrameCameraPose,
-            simd_length(pose.forward) > 0.0001
-        else {
+        camera.look(
+            at: .zero,
+            from: SIMD3<Float>(0, 0, previewCameraDistance),
+            relativeTo: anchor
+        )
+    }
+
+    private func configurePreviewCamera(
+        _ camera: PerspectiveCamera,
+        previewPose: CaptureCameraPose?,
+        relativeTo anchor: AnchorEntity
+    ) {
+        guard let previewPose else {
             camera.look(
                 at: .zero,
                 from: SIMD3<Float>(0, 0, previewCameraDistance),
@@ -372,23 +439,74 @@ final class CapturePreviewViewController: UIViewController {
             return
         }
 
-        let previewPosition = (pose.position - originalCenter) / radius
-        let previewTarget = previewPosition + simd_normalize(pose.forward)
-        let upVector = simd_length(pose.up) > 0.0001 ? simd_normalize(pose.up) : SIMD3<Float>(0, 1, 0)
         camera.look(
-            at: previewTarget,
-            from: previewPosition,
-            upVector: upVector,
+            at: previewPose.position + previewPose.forward,
+            from: previewPose.position,
+            upVector: previewPose.up,
             relativeTo: anchor
         )
     }
 
-    private func updatePreviewRootTransform() {
+    private func movePreviewCamera(to pose: CaptureCameraPose) {
+        guard let previewCamera, let previewAnchor else { return }
+        let convertedPose = previewPose(from: pose)
+        configurePreviewCamera(previewCamera, previewPose: convertedPose, relativeTo: previewAnchor)
+        if let convertedPose {
+            statusLabel.text = String(
+                format: "Camera %.2f %.2f %.2f",
+                convertedPose.position.x,
+                convertedPose.position.y,
+                convertedPose.position.z
+            )
+        }
+    }
+
+    private func previewPose(from pose: CaptureCameraPose?) -> CaptureCameraPose? {
+        guard let pose, simd_length(pose.forward) > 0.0001 else { return nil }
+
+        guard
+            let previewContentEntity,
+            let previewAnchor
+        else {
+            let rotation = currentPreviewRotation()
+            let centeredPosition = pose.position - previewOriginalCenter
+            let position = simd_act(rotation, centeredPosition * previewScale)
+            let forward = simd_act(rotation, simd_normalize(pose.forward))
+            let up = simd_length(pose.up) > 0.0001
+                ? simd_act(rotation, simd_normalize(pose.up))
+                : SIMD3<Float>(0, 1, 0)
+            return CaptureCameraPose(position: position, forward: forward, up: up)
+        }
+
+        let transform = previewContentEntity.transformMatrix(relativeTo: previewAnchor)
+        let position4 = transform * SIMD4<Float>(pose.position.x, pose.position.y, pose.position.z, 1)
+        let forward4 = transform * SIMD4<Float>(pose.forward.x, pose.forward.y, pose.forward.z, 0)
+        let up4 = transform * SIMD4<Float>(pose.up.x, pose.up.y, pose.up.z, 0)
+
+        let position = SIMD3<Float>(position4.x, position4.y, position4.z)
+        let forward = SIMD3<Float>(forward4.x, forward4.y, forward4.z)
+        let up = simd_length(pose.up) > 0.0001
+            ? SIMD3<Float>(up4.x, up4.y, up4.z)
+            : SIMD3<Float>(0, 1, 0)
+
+        guard simd_length(forward) > 0.0001 else { return nil }
+        return CaptureCameraPose(
+            position: position,
+            forward: simd_normalize(forward),
+            up: simd_length(up) > 0.0001 ? simd_normalize(up) : SIMD3<Float>(0, 1, 0)
+        )
+    }
+
+    private func currentPreviewRotation() -> simd_quatf {
         let yawRotation = simd_quatf(angle: previewYaw, axis: SIMD3<Float>(0, 1, 0))
         let pitchRotation = simd_quatf(angle: previewPitch, axis: SIMD3<Float>(1, 0, 0))
+        return yawRotation * pitchRotation
+    }
+
+    private func updatePreviewRootTransform() {
         previewRootEntity?.transform = Transform(
             scale: SIMD3<Float>(repeating: previewScale),
-            rotation: yawRotation * pitchRotation,
+            rotation: currentPreviewRotation(),
             translation: .zero
         )
     }
@@ -417,5 +535,91 @@ final class CapturePreviewViewController: UIViewController {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+}
+
+extension CapturePreviewViewController: UICollectionViewDataSource, UICollectionViewDelegate {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        frameSummaries.count
+    }
+
+    func collectionView(
+        _ collectionView: UICollectionView,
+        cellForItemAt indexPath: IndexPath
+    ) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(
+            withReuseIdentifier: CaptureFrameThumbnailCell.reuseIdentifier,
+            for: indexPath
+        )
+        guard let thumbnailCell = cell as? CaptureFrameThumbnailCell else { return cell }
+        thumbnailCell.configure(with: frameSummaries[indexPath.item].imageURL)
+        return thumbnailCell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        selectFrame(at: indexPath.item)
+    }
+}
+
+private final class CaptureFrameThumbnailCell: UICollectionViewCell {
+    static let reuseIdentifier = "CaptureFrameThumbnailCell"
+
+    private let imageView = UIImageView()
+    private var representedURL: URL?
+
+    override var isSelected: Bool {
+        didSet {
+            contentView.layer.borderColor = (isSelected ? UIColor.systemGreen : UIColor.clear).cgColor
+            contentView.layer.borderWidth = isSelected ? 3 : 0
+        }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        contentView.backgroundColor = .secondarySystemBackground
+        contentView.layer.cornerRadius = 6
+        contentView.layer.masksToBounds = true
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        contentView.addSubview(imageView)
+
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        representedURL = nil
+        imageView.image = nil
+    }
+
+    func configure(with imageURL: URL) {
+        representedURL = imageURL
+        let targetSize = CGSize(width: 144, height: 108)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let image = UIImage(contentsOfFile: imageURL.path)?.preparingThumbnail(of: targetSize)
+            DispatchQueue.main.async {
+                guard self?.representedURL == imageURL else { return }
+                self?.imageView.image = image
+            }
+        }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
