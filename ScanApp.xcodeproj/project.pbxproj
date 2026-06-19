@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		489C50222FD9AF6E00225A32 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = 489C50212FD9AF6E00225A32 /* MLX */; };
+		48CDDEBE2FE5304300C7590E /* SDWebImage in Frameworks */ = {isa = PBXBuildFile; productRef = 48CDDEBD2FE5304300C7590E /* SDWebImage */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,6 +41,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				48CDDEBE2FE5304300C7590E /* SDWebImage in Frameworks */,
 				489C50222FD9AF6E00225A32 /* MLX in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -84,6 +86,7 @@
 			name = ScanApp;
 			packageProductDependencies = (
 				489C50212FD9AF6E00225A32 /* MLX */,
+				48CDDEBD2FE5304300C7590E /* SDWebImage */,
 			);
 			productName = ScanApp;
 			productReference = 48C01B642FD9A87D000170BC /* ScanApp.app */;
@@ -115,6 +118,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				489C50202FD9AF6E00225A32 /* XCRemoteSwiftPackageReference "mlx-swift" */,
+				48CDDEBC2FE5304300C7590E /* XCRemoteSwiftPackageReference "SDWebImage" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 48C01B652FD9A87D000170BC /* Products */;
@@ -378,6 +382,14 @@
 				minimumVersion = 0.31.4;
 			};
 		};
+		48CDDEBC2FE5304300C7590E /* XCRemoteSwiftPackageReference "SDWebImage" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/SDWebImage/SDWebImage.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.21.7;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -385,6 +397,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 489C50202FD9AF6E00225A32 /* XCRemoteSwiftPackageReference "mlx-swift" */;
 			productName = MLX;
+		};
+		48CDDEBD2FE5304300C7590E /* SDWebImage */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 48CDDEBC2FE5304300C7590E /* XCRemoteSwiftPackageReference "SDWebImage" */;
+			productName = SDWebImage;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
