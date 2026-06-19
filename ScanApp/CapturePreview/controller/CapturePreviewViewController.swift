@@ -7,6 +7,7 @@
 
 import UIKit
 import RealityKit
+import SDWebImage
 import simd
 
 final class CapturePreviewViewController: UIViewController {
@@ -18,7 +19,9 @@ final class CapturePreviewViewController: UIViewController {
     private let framesCollectionView: UICollectionView
     private let metadataLabel = UILabel()
     private let statusLabel = UILabel()
+    private let playButton = UIButton(type: .system)
     private let processButton = UIButton(type: .system)
+    private let playbackFrameDuration: TimeInterval = 0.1
 
     private var latestResult: CapturePointCloudResult?
     private var realityView: ARView?
@@ -35,6 +38,7 @@ final class CapturePreviewViewController: UIViewController {
     private var frameSummaries: [CaptureFrameSummary] = []
     private var selectedFrameIndex: Int?
     private var shareButton: UIBarButtonItem?
+    private var isPlaying = false
 
     init(session: CapturedScanSession) {
         self.session = session
@@ -54,6 +58,7 @@ final class CapturePreviewViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        CameraPlaybackRuntime.registerIfNeeded()
         title = session.displayTitle
         view.backgroundColor = .systemBackground
         configureUI()
@@ -90,6 +95,14 @@ final class CapturePreviewViewController: UIViewController {
         statusLabel.layer.masksToBounds = true
         statusLabel.textAlignment = .center
 
+        playButton.setTitle("Play", for: .normal)
+        playButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
+        playButton.tintColor = .white
+        playButton.backgroundColor = .systemGreen
+        playButton.layer.cornerRadius = 8
+        playButton.translatesAutoresizingMaskIntoConstraints = false
+        playButton.addTarget(self, action: #selector(togglePlayback), for: .touchUpInside)
+
         processButton.setTitle("Create USDZ Preview", for: .normal)
         processButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         processButton.tintColor = .white
@@ -102,6 +115,7 @@ final class CapturePreviewViewController: UIViewController {
         view.addSubview(sceneContainerView)
         view.addSubview(framesCollectionView)
         view.addSubview(metadataLabel)
+        view.addSubview(playButton)
         view.addSubview(processButton)
         view.addSubview(statusLabel)
 
@@ -126,9 +140,14 @@ final class CapturePreviewViewController: UIViewController {
             framesCollectionView.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 10),
             framesCollectionView.heightAnchor.constraint(equalToConstant: 62),
 
+            playButton.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
+            playButton.topAnchor.constraint(equalTo: framesCollectionView.bottomAnchor, constant: 12),
+            playButton.widthAnchor.constraint(equalToConstant: 96),
+            playButton.heightAnchor.constraint(equalToConstant: 38),
+
             metadataLabel.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
             metadataLabel.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            metadataLabel.topAnchor.constraint(equalTo: framesCollectionView.bottomAnchor, constant: 12),
+            metadataLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 12),
 
             processButton.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
             processButton.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
@@ -153,9 +172,12 @@ final class CapturePreviewViewController: UIViewController {
     private func loadSummary() {
         latestResult = nil
         selectedFrameIndex = nil
+        stopPlayback(resetButton: true)
         frameSummaries = processor.loadFrameSummaries(session: session)
         framesCollectionView.reloadData()
         framesCollectionView.isHidden = frameSummaries.isEmpty
+        playButton.isEnabled = frameSummaries.count > 1
+        playButton.alpha = frameSummaries.count > 1 ? 1 : 0.45
         hideUSDZPreview()
 
         let existingUSDZURL = findExistingUSDZURL()
@@ -196,9 +218,17 @@ final class CapturePreviewViewController: UIViewController {
         }
     }
 
-    private func selectFrame(at index: Int, updateRealityCamera: Bool = true) {
+    private func selectFrame(
+        at index: Int,
+        updateRealityCamera: Bool = true,
+        resetPlayback: Bool = false,
+        cameraAnimationDuration: TimeInterval = 0
+    ) {
         guard frameSummaries.indices.contains(index) else { return }
 
+        if resetPlayback {
+            stopPlayback(resetButton: true)
+        }
         selectedFrameIndex = index
         let summary = frameSummaries[index]
         if sceneContainerView.isHidden {
@@ -219,7 +249,7 @@ final class CapturePreviewViewController: UIViewController {
         ].joined(separator: "\n")
 
         if updateRealityCamera {
-            movePreviewCamera(to: summary.cameraPose)
+            movePreviewCamera(to: summary.cameraPose, animatedDuration: cameraAnimationDuration)
         }
     }
 
@@ -231,6 +261,7 @@ final class CapturePreviewViewController: UIViewController {
     }
 
     @objc private func processPointCloud() {
+        stopPlayback(resetButton: true)
         processButton.isEnabled = false
         processButton.alpha = 0.55
         latestResult = nil
@@ -268,6 +299,7 @@ final class CapturePreviewViewController: UIViewController {
     }
 
     @objc private func shareCurrentOutput() {
+        stopPlayback(resetButton: true)
         let activityViewController = UIActivityViewController(
             activityItems: [session.url],
             applicationActivities: nil
@@ -333,6 +365,7 @@ final class CapturePreviewViewController: UIViewController {
     }
 
     private func hideUSDZPreview() {
+        stopPlayback(resetButton: true)
         previewAnchor.map { realityView?.scene.removeAnchor($0) }
         previewAnchor = nil
         previewRootEntity = nil
@@ -428,7 +461,8 @@ final class CapturePreviewViewController: UIViewController {
     private func configurePreviewCamera(
         _ camera: PerspectiveCamera,
         previewPose: CaptureCameraPose?,
-        relativeTo anchor: AnchorEntity
+        relativeTo anchor: AnchorEntity,
+        animatedDuration: TimeInterval = 0
     ) {
         guard let previewPose else {
             camera.look(
@@ -439,18 +473,34 @@ final class CapturePreviewViewController: UIViewController {
             return
         }
 
+        let currentTransform = camera.transform
         camera.look(
             at: previewPose.position + previewPose.forward,
             from: previewPose.position,
             upVector: previewPose.up,
             relativeTo: anchor
         )
+        guard animatedDuration > 0 else { return }
+
+        let targetTransform = camera.transform
+        camera.transform = currentTransform
+        camera.move(
+            to: targetTransform,
+            relativeTo: camera.parent,
+            duration: animatedDuration,
+            timingFunction: .easeInOut
+        )
     }
 
-    private func movePreviewCamera(to pose: CaptureCameraPose) {
+    private func movePreviewCamera(to pose: CaptureCameraPose, animatedDuration: TimeInterval = 0) {
         guard let previewCamera, let previewAnchor else { return }
         let convertedPose = previewPose(from: pose)
-        configurePreviewCamera(previewCamera, previewPose: convertedPose, relativeTo: previewAnchor)
+        configurePreviewCamera(
+            previewCamera,
+            previewPose: convertedPose,
+            relativeTo: previewAnchor,
+            animatedDuration: animatedDuration
+        )
         if let convertedPose {
             statusLabel.text = String(
                 format: "Camera %.2f %.2f %.2f",
@@ -511,8 +561,86 @@ final class CapturePreviewViewController: UIViewController {
         )
     }
 
+    @objc private func togglePlayback() {
+        if isPlaying {
+            stopPlayback(resetButton: true)
+        } else {
+            startPlayback()
+        }
+    }
+
+    private func startPlayback() {
+        guard frameSummaries.count > 1, let previewCamera else { return }
+
+        if selectedFrameIndex == nil || selectedFrameIndex == frameSummaries.count - 1 {
+            selectFrame(at: 0, updateRealityCamera: true)
+        }
+
+        let startIndex = selectedFrameIndex ?? 0
+        guard let component = makePlaybackComponent(startIndex: startIndex) else { return }
+        previewCamera.components[CameraPlaybackComponent.self] = component
+        isPlaying = true
+        playButton.setTitle("Pause", for: .normal)
+        playButton.backgroundColor = .systemOrange
+    }
+
+    private func stopPlayback(resetButton: Bool) {
+        isPlaying = false
+        previewCamera?.components[CameraPlaybackComponent.self]?.isPlaying = false
+        guard resetButton else { return }
+        playButton.setTitle("Play", for: .normal)
+        playButton.backgroundColor = .systemGreen
+    }
+
+    private func makePlaybackComponent(startIndex: Int) -> CameraPlaybackComponent? {
+        guard
+            let previewCamera,
+            let previewAnchor
+        else {
+            return nil
+        }
+
+        let originalTransform = previewCamera.transform
+        var keyframes: [CameraPlaybackKeyframe] = []
+        keyframes.reserveCapacity(frameSummaries.count)
+
+        for (index, summary) in frameSummaries.enumerated() {
+            guard let convertedPose = previewPose(from: summary.cameraPose) else { continue }
+            configurePreviewCamera(previewCamera, previewPose: convertedPose, relativeTo: previewAnchor)
+            keyframes.append(
+                CameraPlaybackKeyframe(
+                    time: TimeInterval(index) * playbackFrameDuration,
+                    frameIndex: index,
+                    transform: previewCamera.transform
+                )
+            )
+        }
+
+        previewCamera.transform = originalTransform
+        guard keyframes.count > 1 else { return nil }
+        if let firstKeyframe = keyframes.first {
+            keyframes.append(
+                CameraPlaybackKeyframe(
+                    time: TimeInterval(keyframes.count) * playbackFrameDuration,
+                    frameIndex: firstKeyframe.frameIndex,
+                    transform: firstKeyframe.transform
+                )
+            )
+        }
+
+        let startTime = keyframes.first(where: { $0.frameIndex == startIndex })?.time ?? keyframes[0].time
+        return CameraPlaybackComponent(
+            keyframes: keyframes,
+            elapsedTime: startTime,
+            isPlaying: true
+        )
+    }
+
     @objc private func handlePreviewPan(_ recognizer: UIPanGestureRecognizer) {
         guard previewRootEntity != nil else { return }
+        if recognizer.state == .began {
+            stopPlayback(resetButton: true)
+        }
 
         let translation = recognizer.translation(in: sceneContainerView)
         previewYaw += Float(translation.x) * 0.008
@@ -524,6 +652,9 @@ final class CapturePreviewViewController: UIViewController {
 
     @objc private func handlePreviewPinch(_ recognizer: UIPinchGestureRecognizer) {
         guard previewRootEntity != nil else { return }
+        if recognizer.state == .began {
+            stopPlayback(resetButton: true)
+        }
 
         previewScale *= Float(recognizer.scale)
         previewScale = min(max(previewScale, 0.05), 100)
@@ -557,7 +688,89 @@ extension CapturePreviewViewController: UICollectionViewDataSource, UICollection
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        selectFrame(at: indexPath.item)
+        selectFrame(at: indexPath.item, resetPlayback: true)
+    }
+}
+
+private enum CameraPlaybackRuntime {
+    private static var isRegistered = false
+
+    static func registerIfNeeded() {
+        guard !isRegistered else { return }
+        CameraPlaybackComponent.registerComponent()
+        CameraPlaybackSystem.registerSystem()
+        isRegistered = true
+    }
+}
+
+private struct CameraPlaybackKeyframe {
+    let time: TimeInterval
+    let frameIndex: Int
+    let transform: Transform
+}
+
+private struct CameraPlaybackComponent: Component {
+    var keyframes: [CameraPlaybackKeyframe]
+    var elapsedTime: TimeInterval
+    var isPlaying: Bool
+}
+
+private struct CameraPlaybackSystem: System {
+    private static let query = EntityQuery(where: .has(CameraPlaybackComponent.self))
+
+    init(scene: Scene) {}
+
+    func update(context: SceneUpdateContext) {
+        for entity in context.entities(matching: Self.query, updatingSystemWhen: .rendering) {
+            guard
+                var component = entity.components[CameraPlaybackComponent.self],
+                component.isPlaying,
+                component.keyframes.count > 1,
+                let lastTime = component.keyframes.last?.time,
+                lastTime > 0
+            else {
+                continue
+            }
+
+            component.elapsedTime += context.deltaTime
+            if component.elapsedTime > lastTime {
+                component.elapsedTime = component.elapsedTime.truncatingRemainder(dividingBy: lastTime)
+            }
+
+            entity.transform = interpolatedTransform(
+                at: component.elapsedTime,
+                keyframes: component.keyframes
+            )
+            entity.components[CameraPlaybackComponent.self] = component
+        }
+    }
+
+    private func interpolatedTransform(
+        at time: TimeInterval,
+        keyframes: [CameraPlaybackKeyframe]
+    ) -> Transform {
+        guard let first = keyframes.first else { return Transform() }
+        guard let nextIndex = keyframes.firstIndex(where: { $0.time >= time }) else {
+            return keyframes.last?.transform ?? first.transform
+        }
+
+        if nextIndex == 0 {
+            return first.transform
+        }
+
+        let previous = keyframes[nextIndex - 1]
+        let next = keyframes[nextIndex]
+        let duration = max(next.time - previous.time, 0.0001)
+        let t = Float(min(max((time - previous.time) / duration, 0), 1))
+        return Transform(
+            scale: mix(previous.transform.scale, next.transform.scale, t),
+            rotation: simd_slerp(previous.transform.rotation, next.transform.rotation, t),
+            translation: mix(previous.transform.translation, next.transform.translation, t)
+        )
+    }
+
+    private func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
+        a * (1 - t) + b * t
     }
 }
 
@@ -602,19 +815,19 @@ private final class CaptureFrameThumbnailCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         representedURL = nil
+        imageView.sd_cancelCurrentImageLoad()
         imageView.image = nil
     }
 
     func configure(with imageURL: URL) {
         representedURL = imageURL
         let targetSize = CGSize(width: 144, height: 108)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let image = UIImage(contentsOfFile: imageURL.path)?.preparingThumbnail(of: targetSize)
-            DispatchQueue.main.async {
-                guard self?.representedURL == imageURL else { return }
-                self?.imageView.image = image
-            }
-        }
+        imageView.sd_setImage(
+            with: imageURL,
+            placeholderImage: nil,
+            options: [.scaleDownLargeImages],
+            context: [.imageThumbnailPixelSize: targetSize]
+        )
     }
 }
 
