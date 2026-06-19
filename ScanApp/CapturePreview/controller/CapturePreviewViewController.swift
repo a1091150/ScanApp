@@ -21,7 +21,7 @@ final class CapturePreviewViewController: UIViewController {
     private let statusLabel = UILabel()
     private let playButton = UIButton(type: .system)
     private let processButton = UIButton(type: .system)
-    private let playbackFrameDuration: TimeInterval = 0.1
+    private let playbackFrameDuration: TimeInterval = 0.2
 
     private var latestResult: CapturePointCloudResult?
     private var realityView: ARView?
@@ -39,6 +39,8 @@ final class CapturePreviewViewController: UIViewController {
     private var selectedFrameIndex: Int?
     private var shareButton: UIBarButtonItem?
     private var isPlaying = false
+    private var usdzLoadTask: Task<Void, Never>?
+    private var loadingUSDZURL: URL?
 
     init(session: CapturedScanSession) {
         self.session = session
@@ -54,6 +56,10 @@ final class CapturePreviewViewController: UIViewController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        usdzLoadTask?.cancel()
     }
 
     override func viewDidLoad() {
@@ -351,21 +357,43 @@ final class CapturePreviewViewController: UIViewController {
     }
 
     private func showUSDZPreview(url: URL) {
-        do {
-            configureRealityViewIfNeeded()
-            let entity = try Entity.load(contentsOf: url)
-            displayRealityEntity(entity)
-            imageView.isHidden = true
-            sceneContainerView.isHidden = false
-        } catch {
-            hideUSDZPreview()
-            statusLabel.text = "Preview failed"
-            showAlert(title: "USDZ Preview Failed", message: error.localizedDescription)
+        usdzLoadTask?.cancel()
+        loadingUSDZURL = url
+        statusLabel.text = "Loading USDZ"
+
+        usdzLoadTask = Task { [weak self] in
+            do {
+                let entity = try await Entity(contentsOf: url)
+                await MainActor.run {
+                    guard let self, self.loadingUSDZURL == url else { return }
+                    self.usdzLoadTask = nil
+                    self.loadingUSDZURL = nil
+                    self.configureRealityViewIfNeeded()
+                    self.displayRealityEntity(entity)
+                    self.imageView.isHidden = true
+                    self.sceneContainerView.isHidden = false
+                    self.statusLabel.text = "Ready"
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run {
+                    guard let self, self.loadingUSDZURL == url else { return }
+                    self.usdzLoadTask = nil
+                    self.loadingUSDZURL = nil
+                    self.hideUSDZPreview()
+                    self.statusLabel.text = "Preview failed"
+                    self.showAlert(title: "USDZ Preview Failed", message: error.localizedDescription)
+                }
+            }
         }
     }
 
     private func hideUSDZPreview() {
         stopPlayback(resetButton: true)
+        usdzLoadTask?.cancel()
+        usdzLoadTask = nil
+        loadingUSDZURL = nil
         previewAnchor.map { realityView?.scene.removeAnchor($0) }
         previewAnchor = nil
         previewRootEntity = nil
