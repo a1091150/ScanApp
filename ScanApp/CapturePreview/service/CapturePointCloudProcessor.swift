@@ -30,7 +30,7 @@ struct CapturePointCloudResult {
 }
 
 final class CapturePointCloudProcessor {
-    private let maxPointsPerFrame = 8_192
+    private let maxSampledPointCount = 262_144
     private let minimumDepthDiscontinuityThreshold: Float = 0.04
     private let relativeDepthDiscontinuityThreshold: Float = 0.08
     private let usdzBillboardSize: Float = 0.012
@@ -51,13 +51,19 @@ final class CapturePointCloudProcessor {
 
         let outputURLs: [URL]
         let pointCount: Int
+        let perFrameTargetPointCount = targetPointCountPerFrame(frameCount: frames.count)
         switch outputFormat {
         case .colorPLY:
             var points: [ColoredPoint] = []
             for (index, frame) in frames.enumerated() {
                 status("Processing frame \(index + 1) / \(frames.count)")
-                points.append(contentsOf: try makePoints(from: frame, sessionURL: session.url))
+                points.append(contentsOf: try makePoints(
+                    from: frame,
+                    sessionURL: session.url,
+                    targetPointCount: perFrameTargetPointCount
+                ))
             }
+            points = limitedPoints(points, maxCount: maxSampledPointCount)
 
             let plyURL = outputDirectory.appendingPathComponent("point_cloud_color.ply")
             status("Writing Color PLY")
@@ -67,7 +73,13 @@ final class CapturePointCloudProcessor {
         case .usdz:
             let usdzURL = outputDirectory.appendingPathComponent("point_cloud.usdz")
             status("Writing USDZ")
-            pointCount = try writeUSDZ(frames: frames, sessionURL: session.url, to: usdzURL, status: status)
+            pointCount = try writeUSDZ(
+                frames: frames,
+                sessionURL: session.url,
+                targetPointCountPerFrame: perFrameTargetPointCount,
+                to: usdzURL,
+                status: status
+            )
             outputURLs = [usdzURL]
         }
         status("Done: \(pointCount) points")
@@ -170,13 +182,17 @@ final class CapturePointCloudProcessor {
         )
     }
 
-    private func makePoints(from frame: CaptureFrameMetadata, sessionURL: URL) throws -> [ColoredPoint] {
+    private func makePoints(
+        from frame: CaptureFrameMetadata,
+        sessionURL: URL,
+        targetPointCount: Int
+    ) throws -> [ColoredPoint] {
         let imageURL = sessionURL.appendingPathComponent(frame.imagePath)
         let depthURL = sessionURL.appendingPathComponent(frame.depthPath)
         let image = try RGBAImage(url: imageURL)
         let depthValues = try readDepthValues(url: depthURL, expectedCount: frame.depthWidth * frame.depthHeight)
 
-        let step = samplingStep(for: frame)
+        let step = samplingStep(for: frame, targetPointCount: targetPointCount)
         let sx = Float(frame.depthWidth) / Float(frame.imageWidth)
         let sy = Float(frame.depthHeight) / Float(frame.imageHeight)
         let fx = frame.intrinsics[0] * sx
@@ -185,7 +201,7 @@ final class CapturePointCloudProcessor {
         let cy = frame.intrinsics[5] * sy
 
         var points: [ColoredPoint] = []
-        points.reserveCapacity(min(maxPointsPerFrame, frame.depthWidth * frame.depthHeight))
+        points.reserveCapacity(min(targetPointCount, frame.depthWidth * frame.depthHeight))
 
         for y in stride(from: 0, to: frame.depthHeight, by: step) {
             for x in stride(from: 0, to: frame.depthWidth, by: step) {
@@ -204,8 +220,17 @@ final class CapturePointCloudProcessor {
         return points
     }
 
-    private func samplingStep(for frame: CaptureFrameMetadata) -> Int {
-        max(1, Int(ceil(sqrt(Double(frame.depthWidth * frame.depthHeight) / Double(maxPointsPerFrame)))))
+    private func targetPointCountPerFrame(frameCount: Int) -> Int {
+        max(1, Int(ceil(Double(maxSampledPointCount) / Double(max(1, frameCount)))))
+    }
+
+    private func samplingStep(for frame: CaptureFrameMetadata, targetPointCount: Int) -> Int {
+        max(1, Int(floor(sqrt(Double(frame.depthWidth * frame.depthHeight) / Double(max(1, targetPointCount))))))
+    }
+
+    private func limitedPoints(_ points: [ColoredPoint], maxCount: Int) -> [ColoredPoint] {
+        guard points.count > maxCount else { return points }
+        return Array(points.prefix(maxCount))
     }
 
     private func readDepthValues(url: URL, expectedCount: Int) throws -> [Float] {
@@ -251,15 +276,23 @@ final class CapturePointCloudProcessor {
     private func writeUSDZ(
         frames: [CaptureFrameMetadata],
         sessionURL: URL,
+        targetPointCountPerFrame: Int,
         to url: URL,
         status: @escaping (String) -> Void
     ) throws -> Int {
-        try writePointCloudUSDZ(frames: frames, sessionURL: sessionURL, to: url, status: status)
+        try writePointCloudUSDZ(
+            frames: frames,
+            sessionURL: sessionURL,
+            targetPointCountPerFrame: targetPointCountPerFrame,
+            to: url,
+            status: status
+        )
     }
 
     private func writePointCloudUSDZ(
         frames: [CaptureFrameMetadata],
         sessionURL: URL,
+        targetPointCountPerFrame: Int,
         to url: URL,
         status: @escaping (String) -> Void
     ) throws -> Int {
@@ -268,13 +301,21 @@ final class CapturePointCloudProcessor {
 
         for (index, frame) in frames.enumerated() {
             status("Building billboard frame \(index + 1) / \(frames.count)")
-            let points = try makePoints(from: frame, sessionURL: sessionURL)
+            let remainingPointCount = maxSampledPointCount - totalPointCount
+            guard remainingPointCount > 0 else { break }
+            let frameTargetPointCount = min(targetPointCountPerFrame, remainingPointCount)
+            let points = try makePoints(
+                from: frame,
+                sessionURL: sessionURL,
+                targetPointCount: frameTargetPointCount
+            )
+            let limitedFramePoints = limitedPoints(points, maxCount: remainingPointCount)
             guard !points.isEmpty else { continue }
-            totalPointCount += points.count
+            totalPointCount += limitedFramePoints.count
             billboardMeshes.append(
                 makeBillboardMesh(
                     name: "frame_\(index)",
-                    points: points,
+                    points: limitedFramePoints,
                     frame: frame
                 )
             )
@@ -345,13 +386,17 @@ final class CapturePointCloudProcessor {
         var frameMeshes: [USDZFrameMesh] = []
         var packageFiles: [USDZPackageWriter.PackageFile] = []
         var totalVertexCount = 0
+        let perFrameTargetPointCount = targetPointCountPerFrame(frameCount: frames.count)
 
         for (index, frame) in frames.enumerated() {
             status("Meshing frame \(index + 1) / \(frames.count)")
             var vertices: [USDZMeshVertex] = []
+            let remainingPointCount = maxSampledPointCount - totalVertexCount
+            guard remainingPointCount > 0 else { break }
             let meshIndices = try appendDepthMesh(
                 frame: frame,
                 sessionURL: sessionURL,
+                targetPointCount: min(perFrameTargetPointCount, remainingPointCount),
                 vertices: &vertices
             )
             guard !meshIndices.isEmpty else { continue }
@@ -402,11 +447,12 @@ final class CapturePointCloudProcessor {
     private func appendDepthMesh(
         frame: CaptureFrameMetadata,
         sessionURL: URL,
+        targetPointCount: Int,
         vertices: inout [USDZMeshVertex]
     ) throws -> [UInt32] {
         let depthURL = sessionURL.appendingPathComponent(frame.depthPath)
         let depthValues = try readDepthValues(url: depthURL, expectedCount: frame.depthWidth * frame.depthHeight)
-        let step = samplingStep(for: frame)
+        let step = samplingStep(for: frame, targetPointCount: targetPointCount)
         let sampledX = Array(stride(from: 0, to: frame.depthWidth, by: step))
         let sampledY = Array(stride(from: 0, to: frame.depthHeight, by: step))
         guard sampledX.count > 1, sampledY.count > 1 else { return [] }

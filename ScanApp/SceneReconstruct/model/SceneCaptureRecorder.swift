@@ -16,12 +16,12 @@ final class SceneCaptureRecorder {
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let jpegCompressionQuality: CGFloat = 0.92
-    private let minCaptureInterval: TimeInterval = 0.45
-    private let minTranslationDelta: Float = 0.05
-    private let minRotationDeltaRadians: Float = 7 * .pi / 180
+    private let minCaptureInterval: TimeInterval = 0.45 / 8.0
+    private let minTranslationDelta: Float = 0.05 / 8.0
+    private let minRotationDeltaRadians: Float = (7 * .pi / 180) / 8
     private let maxVelocity: Float = 0.5
     private let maxAngularVelocity: Float = 0.7
-    private let maxPendingWrites = 2
+    private let maxPendingWrites = 8
 
     private var sessionDirectory: URL?
     private var imageDirectory: URL?
