@@ -75,9 +75,69 @@ final class CapturedFilesViewController: UITableViewController {
         openPreview(for: sessions[indexPath.row])
     }
 
+    override func tableView(
+        _ tableView: UITableView,
+        trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath
+    ) -> UISwipeActionsConfiguration? {
+        let deleteAction = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, completion in
+            self?.confirmDeleteSession(at: indexPath, completion: completion)
+        }
+        deleteAction.image = UIImage(systemName: "trash")
+        return UISwipeActionsConfiguration(actions: [deleteAction])
+    }
+
     private func openPreview(for session: CapturedScanSession) {
         let viewController = CapturePreviewViewController(session: session)
         navigationController?.pushViewController(viewController, animated: true)
+    }
+
+    private func confirmDeleteSession(
+        at indexPath: IndexPath,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard indexPath.row < sessions.count else {
+            completion(false)
+            return
+        }
+
+        let session = sessions[indexPath.row]
+        let alert = UIAlertController(
+            title: "Delete Capture?",
+            message: "This will permanently delete \(session.displayTitle) and its images, metadata, and depth files.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+            completion(false)
+        })
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.deleteSession(session, at: indexPath, completion: completion)
+        })
+        present(alert, animated: true)
+    }
+
+    private func deleteSession(
+        _ session: CapturedScanSession,
+        at indexPath: IndexPath,
+        completion: @escaping (Bool) -> Void
+    ) {
+        do {
+            try library.deleteSession(session)
+            guard indexPath.row < sessions.count, sessions[indexPath.row].id == session.id else {
+                reloadSessions()
+                completion(true)
+                return
+            }
+
+            sessions.remove(at: indexPath.row)
+            tableView.deleteRows(at: [indexPath], with: .automatic)
+            if sessions.isEmpty {
+                setEmptyMessage("No captured scans yet.")
+            }
+            completion(true)
+        } catch {
+            completion(false)
+            showAlert(title: "Delete Failed", message: error.localizedDescription)
+        }
     }
 
     private func setEmptyMessage(_ message: String) {

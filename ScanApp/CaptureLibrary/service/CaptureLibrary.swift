@@ -63,6 +63,13 @@ final class CaptureLibrary {
         return destination
     }
 
+    func deleteSession(_ session: CapturedScanSession) throws {
+        guard fileManager.fileExists(atPath: session.url.path) else {
+            return
+        }
+        try fileManager.removeItem(at: session.url)
+    }
+
     private var applicationSupportDirectory: URL {
         fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     }
