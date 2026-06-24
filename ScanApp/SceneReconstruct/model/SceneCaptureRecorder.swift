@@ -119,6 +119,12 @@ final class SceneCaptureRecorder {
         let camera = frame.camera
         let cameraTransform = camera.transform
         let worldToCamera = cameraTransform.inverse
+        let lightEstimate = frame.lightEstimate.map {
+            SceneLightEstimateSnapshot(
+                ambientIntensity: $0.ambientIntensity,
+                ambientColorTemperature: $0.ambientColorTemperature
+            )
+        }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let firstTimestamp = firstFrameTimestamp ?? frame.timestamp
@@ -152,6 +158,7 @@ final class SceneCaptureRecorder {
             projectionMatrix: projection,
             exposureDuration: camera.exposureDuration,
             exposureOffset: camera.exposureOffset,
+            lightEstimate: lightEstimate,
             motion: motion,
             trackingStateText: trackingText(for: camera.trackingState),
             depthSnapshot: depthSnapshot
@@ -249,6 +256,15 @@ final class SceneCaptureRecorder {
             "motionQuality": snapshot.motion.motionQuality,
             "trackingState": snapshot.trackingStateText
         ]
+
+        if let lightEstimate = snapshot.lightEstimate {
+            metadata["ambientIntensity"] = Double(lightEstimate.ambientIntensity)
+            metadata["ambientColorTemperature"] = Double(lightEstimate.ambientColorTemperature)
+            metadata["lightEstimate"] = [
+                "ambientIntensity": Double(lightEstimate.ambientIntensity),
+                "ambientColorTemperature": Double(lightEstimate.ambientColorTemperature)
+            ]
+        }
 
         if let depthVideoFrameInfo {
             metadata["depth_video"] = [

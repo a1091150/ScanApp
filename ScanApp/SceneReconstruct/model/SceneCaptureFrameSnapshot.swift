@@ -11,6 +11,11 @@ import CoreVideo
 import Foundation
 import simd
 
+struct SceneLightEstimateSnapshot {
+    let ambientIntensity: CGFloat
+    let ambientColorTemperature: CGFloat
+}
+
 struct SceneCaptureFrameSnapshot {
     let pixelBuffer: CVPixelBuffer
     let frameIndex: Int
@@ -31,6 +36,7 @@ struct SceneCaptureFrameSnapshot {
     let projectionMatrix: simd_float4x4
     let exposureDuration: TimeInterval
     let exposureOffset: Float
+    let lightEstimate: SceneLightEstimateSnapshot?
     let motion: FrameMotion
     let trackingStateText: String
     let depthSnapshot: SceneDepthFrameSnapshot?

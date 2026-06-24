@@ -209,6 +209,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         }
 
         configuration.environmentTexturing = .automatic
+        configuration.isLightEstimationEnabled = true
 
         do {
             let directory = try viewModel.currentScanDirectory()
