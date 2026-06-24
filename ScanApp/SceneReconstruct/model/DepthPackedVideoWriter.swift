@@ -32,6 +32,7 @@ final class DepthPackedVideoWriter {
     private let minDepth: Float
     private let maxDepth: Float
     private let invalidValue: UInt16 = 0
+    private let depthPacker: DepthMetalPacker
     private var isFinished = false
 
     init(url: URL, relativePath: String, width: Int, height: Int, minDepth: Float = 0, maxDepth: Float = 5) throws {
@@ -42,6 +43,7 @@ final class DepthPackedVideoWriter {
         self.relativePath = relativePath
         self.minDepth = minDepth
         self.maxDepth = maxDepth
+        self.depthPacker = try DepthMetalPacker()
 
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
@@ -63,7 +65,9 @@ final class DepthPackedVideoWriter {
         let attributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
             kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -105,7 +109,13 @@ final class DepthPackedVideoWriter {
             throw SceneCaptureRecorderError.videoWriterFailed("Could not allocate packed depth video pixel buffer.")
         }
 
-        try packDepth(depthMap, into: outputPixelBuffer)
+        try depthPacker.pack(
+            depthMap: depthMap,
+            into: outputPixelBuffer,
+            minDepth: minDepth,
+            maxDepth: maxDepth,
+            invalidValue: invalidValue
+        )
 
         guard adaptor.append(outputPixelBuffer, withPresentationTime: presentationTime) else {
             throw SceneCaptureRecorderError.videoWriterFailed(assetWriter.error?.localizedDescription ?? "Could not append packed depth frame.")
@@ -145,61 +155,4 @@ final class DepthPackedVideoWriter {
         )
     }
 
-    private func packDepth(_ depthMap: CVPixelBuffer, into outputPixelBuffer: CVPixelBuffer) throws {
-        let depthPixelFormat = CVPixelBufferGetPixelFormatType(depthMap)
-        guard depthPixelFormat == kCVPixelFormatType_DepthFloat32 || depthPixelFormat == kCVPixelFormatType_DisparityFloat32 else {
-            throw SceneCaptureRecorderError.unsupportedDepthPixelFormat(depthPixelFormat)
-        }
-        guard CVPixelBufferGetWidth(depthMap) == CVPixelBufferGetWidth(outputPixelBuffer),
-              CVPixelBufferGetHeight(depthMap) == CVPixelBufferGetHeight(outputPixelBuffer) else {
-            throw SceneCaptureRecorderError.videoWriterFailed("Packed depth video dimensions do not match the depth map.")
-        }
-
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        CVPixelBufferLockBaseAddress(outputPixelBuffer, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(outputPixelBuffer, [])
-            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-        }
-
-        guard let depthBaseAddress = CVPixelBufferGetBaseAddress(depthMap),
-              let yBaseAddress = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 0),
-              let cbcrBaseAddress = CVPixelBufferGetBaseAddressOfPlane(outputPixelBuffer, 1) else {
-            throw SceneCaptureRecorderError.pixelBufferBaseAddressUnavailable
-        }
-
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 0)
-        let cbcrBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputPixelBuffer, 1)
-        let scale = Float(1023) / max(maxDepth - minDepth, .leastNonzeroMagnitude)
-
-        for row in 0..<height {
-            let depthRow = depthBaseAddress.advanced(by: row * depthBytesPerRow).assumingMemoryBound(to: Float.self)
-            let yRow = yBaseAddress.advanced(by: row * yBytesPerRow).assumingMemoryBound(to: UInt16.self)
-
-            for column in 0..<width {
-                let depth = depthRow[column]
-                let quantized: UInt16
-                if depth.isFinite, depth > minDepth {
-                    let value = min(max((depth - minDepth) * scale, 1), 1023)
-                    quantized = UInt16(value.rounded())
-                } else {
-                    quantized = invalidValue
-                }
-                yRow[column] = (quantized << 6).littleEndian
-            }
-        }
-
-        let neutralChroma = UInt16(512 << 6).littleEndian
-        let chromaHeight = CVPixelBufferGetHeightOfPlane(outputPixelBuffer, 1)
-        let chromaWidth = CVPixelBufferGetWidthOfPlane(outputPixelBuffer, 1)
-        for row in 0..<chromaHeight {
-            let cbcrRow = cbcrBaseAddress.advanced(by: row * cbcrBytesPerRow).assumingMemoryBound(to: UInt16.self)
-            for column in 0..<(chromaWidth * 2) {
-                cbcrRow[column] = neutralChroma
-            }
-        }
-    }
 }

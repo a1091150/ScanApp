@@ -20,9 +20,7 @@ final class SceneCaptureRecorder {
     private let rgbVideoTimescale: CMTimeScale = 600
 
     private var sessionDirectory: URL?
-    private var metadataDirectory: URL?
     private var depthDirectory: URL?
-    private var metadataWriter: JsonlSegmentWriter?
     private var rgbVideoWriter: RGBVideoWriter?
     private var depthPackedVideoWriter: DepthPackedVideoWriter?
     private var isRecording = false
@@ -48,30 +46,25 @@ final class SceneCaptureRecorder {
 
     func start(sessionDirectory: URL) throws {
         writerQueue.sync {
-            closeMetadataWriter()
             finishRGBVideoWriter()
             finishDepthPackedVideoWriter()
         }
 
         self.sessionDirectory = sessionDirectory
-        metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
         depthDirectory = sessionDirectory.appendingPathComponent("depth", isDirectory: true)
 
-        try FileManager.default.createDirectory(at: metadataDirectory!, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: depthDirectory!, withIntermediateDirectories: true)
-        metadataWriter = try JsonlSegmentWriter(directory: metadataDirectory!)
 
         isRecording = true
         recordingGeneration += 1
         firstFrameTimestamp = nil
-        lastDecision = "Recorder started + RGB video + depth"
+        lastDecision = "Recorder started + RGB video + Metal depth video"
     }
 
     func stop() {
         isRecording = false
         lastDecision = "Recorder stopped"
         writerQueue.async { [weak self] in
-            self?.closeMetadataWriter()
             self?.finishRGBVideoWriter()
             self?.finishDepthPackedVideoWriter()
         }
@@ -80,7 +73,6 @@ final class SceneCaptureRecorder {
     func reset() {
         isRecording = false
         sessionDirectory = nil
-        metadataDirectory = nil
         depthDirectory = nil
         frameIndex = 0
         savedImageCount = 0
@@ -92,7 +84,6 @@ final class SceneCaptureRecorder {
         previousFrameTransform = nil
         lastDecision = "Recorder reset"
         writerQueue.async { [weak self] in
-            self?.closeMetadataWriter()
             self?.finishRGBVideoWriter()
             self?.finishDepthPackedVideoWriter()
         }
@@ -102,7 +93,7 @@ final class SceneCaptureRecorder {
         frameIndex += 1
 
         guard isRecording else { return }
-        guard let sessionDirectory, metadataWriter != nil else {
+        guard let sessionDirectory else {
             lastDecision = "Missing dataset directory"
             return
         }
@@ -210,9 +201,7 @@ final class SceneCaptureRecorder {
     private func writeFrameAssets(_ snapshot: SceneCaptureFrameSnapshot) throws {
         let rgbWriter = try rgbVideoWriter(for: snapshot)
         try rgbWriter.append(snapshot.pixelBuffer, presentationTime: snapshot.rgbPresentationTime)
-        let depthVideoFrameInfo = try writeDepthPackedVideoIfNeeded(snapshot)
-        try writeConfidenceDataIfNeeded(snapshot.depthSnapshot)
-        try metadataWriter?.append(makeMetadata(from: snapshot, depthVideoFrameInfo: depthVideoFrameInfo))
+        _ = try writeDepthPackedVideoIfNeeded(snapshot)
     }
 
     private func makeMetadata(
@@ -371,11 +360,6 @@ final class SceneCaptureRecorder {
         }
     }
 
-    private func closeMetadataWriter() {
-        try? metadataWriter?.close()
-        metadataWriter = nil
-    }
-
     private func finishRGBVideoWriter() {
         let writer = rgbVideoWriter
         rgbVideoWriter = nil
@@ -387,6 +371,7 @@ final class SceneCaptureRecorder {
         depthPackedVideoWriter = nil
         writer?.finish {}
     }
+
 }
 
 fileprivate func flatten3x3(_ matrix: simd_float3x3) -> [Float] {

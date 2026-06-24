@@ -55,12 +55,11 @@ final class SceneReconstructionScanViewModel {
             "required_orientation": "landscapeRight",
             "records_depth_data": true,
             "records_depth_bin": false,
-            "capture_format": "arkit_rgb_video_jsonl_v1",
+            "records_frame_metadata": false,
+            "capture_format": "arkit_rgb_depth_video_metal_v1",
             "dataset_layout": [
                 "rgb": "rgb.mov",
-                "metadata": "metadata/frames_0000.jsonl",
-                "depth_video": "depth/depth_packed_hevc.mov",
-                "confidence": "depth/frame_000001_confidence_u8.bin"
+                "depth_video": "depth/depth_packed_hevc.mov"
             ]
         ]
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
