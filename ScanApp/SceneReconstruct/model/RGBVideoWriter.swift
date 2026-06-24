@@ -79,4 +79,4 @@ final class RGBVideoWriter {
         input.markAsFinished()
         assetWriter.finishWriting(completionHandler: completion)
     }
-}
+} 

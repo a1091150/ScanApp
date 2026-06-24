@@ -6,52 +6,69 @@
 //
 
 import AVFoundation
-import CoreMedia
 import UIKit
-import RealityKit
-import SDWebImage
-import simd
 
 final class CapturePreviewViewController: UIViewController {
+    private enum PreviewKind: Int, CaseIterable {
+        case rgb
+        case depth
+
+        var title: String {
+            switch self {
+            case .rgb:
+                return "RGB"
+            case .depth:
+                return "Depth"
+            }
+        }
+
+        var relativePath: String {
+            switch self {
+            case .rgb:
+                return "rgb.mov"
+            case .depth:
+                return "depth/depth_packed_hevc.mov"
+            }
+        }
+    }
+
+    private struct VideoSummary {
+        let kind: PreviewKind
+        let url: URL
+        let duration: CMTime
+        let naturalSize: CGSize
+        let frameRate: Float
+        let fileSize: Int64?
+    }
+
+    private final class PlayerView: UIView {
+        override static var layerClass: AnyClass {
+            AVPlayerLayer.self
+        }
+
+        var playerLayer: AVPlayerLayer {
+            layer as! AVPlayerLayer
+        }
+    }
+
     private let session: CapturedScanSession
-    private let processor = CapturePointCloudProcessor()
-
-    private let imageView = UIImageView()
-    private let sceneContainerView = UIView()
-    private let framesCollectionView: UICollectionView
-    private let metadataLabel = UILabel()
+    private let previewControl = UISegmentedControl(items: PreviewKind.allCases.map(\.title))
+    private let playerView = PlayerView()
     private let statusLabel = UILabel()
+    private let metadataLabel = UILabel()
     private let playButton = UIButton(type: .system)
-    private let processButton = UIButton(type: .system)
-    private let playbackFrameDuration: TimeInterval = 0.2
+    private let slider = UISlider()
+    private let timeLabel = UILabel()
 
-    private var latestResult: CapturePointCloudResult?
-    private var realityView: ARView?
-    private var previewAnchor: AnchorEntity?
-    private var previewRootEntity: Entity?
-    private var previewContentEntity: Entity?
-    private var previewCamera: PerspectiveCamera?
-    private var previewScale: Float = 1
-    private var previewYaw: Float = 0
-    private var previewPitch: Float = 0
-    private var previewCameraDistance: Float = 1
-    private var previewOriginalCenter: SIMD3<Float> = .zero
-    private var previewRadius: Float = 1
-    private var frameSummaries: [CaptureFrameSummary] = []
-    private var selectedFrameIndex: Int?
+    private var summaries: [PreviewKind: VideoSummary] = [:]
+    private var selectedKind: PreviewKind = .rgb
+    private var player: AVPlayer?
+    private var timeObserver: Any?
+    private var isScrubbing = false
     private var shareButton: UIBarButtonItem?
-    private var isPlaying = false
-    private var usdzLoadTask: Task<Void, Never>?
-    private var loadingUSDZURL: URL?
 
     init(session: CapturedScanSession) {
         self.session = session
-        let layout = UICollectionViewFlowLayout()
-        layout.scrollDirection = .horizontal
-        layout.minimumLineSpacing = 8
-        layout.minimumInteritemSpacing = 8
-        layout.itemSize = CGSize(width: 72, height: 54)
-        framesCollectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -61,41 +78,36 @@ final class CapturePreviewViewController: UIViewController {
     }
 
     deinit {
-        usdzLoadTask?.cancel()
+        removeTimeObserver()
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        CameraPlaybackRuntime.registerIfNeeded()
         title = session.displayTitle
         view.backgroundColor = .systemBackground
         configureUI()
         configureNavigationItems()
-        loadSummary()
+        loadVideos()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        playerView.playerLayer.videoGravity = .resizeAspect
     }
 
     private func configureUI() {
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .black
+        previewControl.translatesAutoresizingMaskIntoConstraints = false
+        previewControl.selectedSegmentIndex = selectedKind.rawValue
+        previewControl.addTarget(self, action: #selector(selectPreviewKind), for: .valueChanged)
 
-        sceneContainerView.translatesAutoresizingMaskIntoConstraints = false
-        sceneContainerView.backgroundColor = .black
-        sceneContainerView.isHidden = true
-
-        framesCollectionView.translatesAutoresizingMaskIntoConstraints = false
-        framesCollectionView.backgroundColor = .clear
-        framesCollectionView.showsHorizontalScrollIndicator = false
-        framesCollectionView.dataSource = self
-        framesCollectionView.delegate = self
-        framesCollectionView.register(CaptureFrameThumbnailCell.self, forCellWithReuseIdentifier: CaptureFrameThumbnailCell.reuseIdentifier)
-
-        metadataLabel.translatesAutoresizingMaskIntoConstraints = false
-        metadataLabel.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        metadataLabel.numberOfLines = 0
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        playerView.backgroundColor = .black
+        playerView.layer.cornerRadius = 8
+        playerView.layer.masksToBounds = true
+        playerView.playerLayer.videoGravity = .resizeAspect
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.text = "Ready"
+        statusLabel.text = "Loading"
         statusLabel.textColor = .white
         statusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
         statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.65)
@@ -103,66 +115,73 @@ final class CapturePreviewViewController: UIViewController {
         statusLabel.layer.masksToBounds = true
         statusLabel.textAlignment = .center
 
+        playButton.translatesAutoresizingMaskIntoConstraints = false
         playButton.setTitle("Play", for: .normal)
         playButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         playButton.tintColor = .white
         playButton.backgroundColor = .systemGreen
         playButton.layer.cornerRadius = 8
-        playButton.translatesAutoresizingMaskIntoConstraints = false
         playButton.addTarget(self, action: #selector(togglePlayback), for: .touchUpInside)
 
-        processButton.setTitle("Create USDZ Preview", for: .normal)
-        processButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
-        processButton.tintColor = .white
-        processButton.backgroundColor = .systemBlue
-        processButton.layer.cornerRadius = 8
-        processButton.translatesAutoresizingMaskIntoConstraints = false
-        processButton.addTarget(self, action: #selector(processPointCloud), for: .touchUpInside)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 0
+        slider.maximumValue = 1
+        slider.value = 0
+        slider.addTarget(self, action: #selector(beginScrubbing), for: .touchDown)
+        slider.addTarget(self, action: #selector(updateScrubbing), for: .valueChanged)
+        slider.addTarget(self, action: #selector(endScrubbing), for: [.touchUpInside, .touchUpOutside, .touchCancel])
 
-        view.addSubview(imageView)
-        view.addSubview(sceneContainerView)
-        view.addSubview(framesCollectionView)
-        view.addSubview(metadataLabel)
-        view.addSubview(playButton)
-        view.addSubview(processButton)
+        timeLabel.translatesAutoresizingMaskIntoConstraints = false
+        timeLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        timeLabel.textColor = .secondaryLabel
+        timeLabel.textAlignment = .right
+        timeLabel.text = "0.00 / 0.00"
+
+        metadataLabel.translatesAutoresizingMaskIntoConstraints = false
+        metadataLabel.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        metadataLabel.numberOfLines = 0
+        metadataLabel.textColor = .label
+
+        view.addSubview(previewControl)
+        view.addSubview(playerView)
         view.addSubview(statusLabel)
+        view.addSubview(playButton)
+        view.addSubview(slider)
+        view.addSubview(timeLabel)
+        view.addSubview(metadataLabel)
 
         NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            imageView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            imageView.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor, multiplier: 0.52),
+            previewControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            previewControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            previewControl.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
 
-            sceneContainerView.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
-            sceneContainerView.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            sceneContainerView.topAnchor.constraint(equalTo: imageView.topAnchor),
-            sceneContainerView.bottomAnchor.constraint(equalTo: imageView.bottomAnchor),
+            playerView.leadingAnchor.constraint(equalTo: previewControl.leadingAnchor),
+            playerView.trailingAnchor.constraint(equalTo: previewControl.trailingAnchor),
+            playerView.topAnchor.constraint(equalTo: previewControl.bottomAnchor, constant: 12),
+            playerView.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor, multiplier: 0.55),
 
-            statusLabel.trailingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: -10),
-            statusLabel.topAnchor.constraint(equalTo: imageView.topAnchor, constant: 10),
-            statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 130),
+            statusLabel.trailingAnchor.constraint(equalTo: playerView.trailingAnchor, constant: -10),
+            statusLabel.topAnchor.constraint(equalTo: playerView.topAnchor, constant: 10),
+            statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
             statusLabel.heightAnchor.constraint(equalToConstant: 30),
 
-            framesCollectionView.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
-            framesCollectionView.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            framesCollectionView.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 10),
-            framesCollectionView.heightAnchor.constraint(equalToConstant: 62),
-
-            playButton.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
-            playButton.topAnchor.constraint(equalTo: framesCollectionView.bottomAnchor, constant: 12),
+            playButton.leadingAnchor.constraint(equalTo: playerView.leadingAnchor),
+            playButton.topAnchor.constraint(equalTo: playerView.bottomAnchor, constant: 14),
             playButton.widthAnchor.constraint(equalToConstant: 96),
             playButton.heightAnchor.constraint(equalToConstant: 38),
 
-            metadataLabel.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
-            metadataLabel.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            metadataLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 12),
+            slider.leadingAnchor.constraint(equalTo: playButton.trailingAnchor, constant: 12),
+            slider.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
 
-            processButton.leadingAnchor.constraint(equalTo: imageView.leadingAnchor),
-            processButton.trailingAnchor.constraint(equalTo: imageView.trailingAnchor),
-            processButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
-            processButton.heightAnchor.constraint(equalToConstant: 48),
+            timeLabel.leadingAnchor.constraint(equalTo: slider.trailingAnchor, constant: 12),
+            timeLabel.trailingAnchor.constraint(equalTo: playerView.trailingAnchor),
+            timeLabel.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
+            timeLabel.widthAnchor.constraint(equalToConstant: 112),
 
-            metadataLabel.bottomAnchor.constraint(lessThanOrEqualTo: processButton.topAnchor, constant: -12)
+            metadataLabel.leadingAnchor.constraint(equalTo: playerView.leadingAnchor),
+            metadataLabel.trailingAnchor.constraint(equalTo: playerView.trailingAnchor),
+            metadataLabel.topAnchor.constraint(equalTo: playButton.bottomAnchor, constant: 16),
+            metadataLabel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
         ])
     }
 
@@ -172,162 +191,179 @@ final class CapturePreviewViewController: UIViewController {
             target: self,
             action: #selector(shareCurrentOutput)
         )
-        item.isEnabled = true
         navigationItem.rightBarButtonItem = item
         shareButton = item
     }
 
-    private func loadSummary() {
-        latestResult = nil
-        selectedFrameIndex = nil
-        stopPlayback(resetButton: true)
-        frameSummaries = processor.loadFrameSummaries(session: session)
-        framesCollectionView.reloadData()
-        framesCollectionView.isHidden = frameSummaries.isEmpty
-        playButton.isEnabled = frameSummaries.count > 1
-        playButton.alpha = frameSummaries.count > 1 ? 1 : 0.45
-        hideUSDZPreview()
-
-        let existingUSDZURL = findExistingUSDZURL()
-
-        guard let summary = frameSummaries.first else {
-            if let existingUSDZURL {
-                metadataLabel.text = [
-                    "Preview: USDZ",
-                    "Output: \(existingUSDZURL.lastPathComponent)",
-                    "Session: \(session.id)"
-                ].joined(separator: "\n")
-                showUSDZPreview(url: existingUSDZURL)
-                return
+    private func loadVideos() {
+        summaries = Dictionary(
+            uniqueKeysWithValues: PreviewKind.allCases.compactMap { kind in
+                guard let summary = makeVideoSummary(kind: kind) else { return nil }
+                return (kind, summary)
             }
+        )
 
-            metadataLabel.text = "No previewable frames found."
-            imageView.image = nil
+        for kind in PreviewKind.allCases {
+            previewControl.setEnabled(summaries[kind] != nil, forSegmentAt: kind.rawValue)
+        }
+
+        if summaries[selectedKind] == nil {
+            selectedKind = summaries[.rgb] != nil ? .rgb : .depth
+            previewControl.selectedSegmentIndex = selectedKind.rawValue
+        }
+
+        guard summaries[selectedKind] != nil else {
+            playerView.playerLayer.player = nil
+            playButton.isEnabled = false
+            slider.isEnabled = false
+            statusLabel.text = "No video"
+            metadataLabel.text = [
+                "No previewable video found.",
+                "Expected: rgb.mov",
+                "Expected: depth/depth_packed_hevc.mov",
+                "Session: \(session.id)"
+            ].joined(separator: "\n")
             return
         }
 
-        selectFrame(at: 0, updateRealityCamera: false)
-        let previewText: String
-        if let existingUSDZURL {
-            previewText = "Preview: USDZ\nOutput: \(existingUSDZURL.lastPathComponent)"
-        } else {
-            previewText = "Preview: image"
-        }
-        metadataLabel.text = [
-            "Frame: \(summary.frameName)",
-            summary.cameraPositionText,
-            summary.cameraForwardText,
-            "Session: \(session.id)",
-            previewText
-        ].joined(separator: "\n")
-
-        if let existingUSDZURL {
-            showUSDZPreview(url: existingUSDZURL)
-        }
+        playButton.isEnabled = true
+        slider.isEnabled = true
+        loadSelectedVideo(autoplay: false)
     }
 
-    private func selectFrame(
-        at index: Int,
-        updateRealityCamera: Bool = true,
-        resetPlayback: Bool = false,
-        cameraAnimationDuration: TimeInterval = 0
-    ) {
-        guard frameSummaries.indices.contains(index) else { return }
+    private func makeVideoSummary(kind: PreviewKind) -> VideoSummary? {
+        let url = session.url.appendingPathComponent(kind.relativePath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
 
-        if resetPlayback {
-            stopPlayback(resetButton: true)
-        }
-        selectedFrameIndex = index
-        let summary = frameSummaries[index]
-        if sceneContainerView.isHidden {
-            imageView.image = previewImage(for: summary)
-        }
-        framesCollectionView.selectItem(
-            at: IndexPath(item: index, section: 0),
-            animated: true,
-            scrollPosition: .centeredHorizontally
+        let asset = AVURLAsset(url: url)
+        let track = asset.tracks(withMediaType: .video).first
+        let naturalSize = track?.naturalSize.applying(track?.preferredTransform ?? .identity) ?? .zero
+        let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init)
+
+        return VideoSummary(
+            kind: kind,
+            url: url,
+            duration: asset.duration,
+            naturalSize: CGSize(width: abs(naturalSize.width), height: abs(naturalSize.height)),
+            frameRate: track?.nominalFrameRate ?? 0,
+            fileSize: fileSize
         )
+    }
 
+    private func loadSelectedVideo(autoplay: Bool) {
+        guard let summary = summaries[selectedKind] else { return }
+
+        removeTimeObserver()
+        NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: nil)
+
+        let item = AVPlayerItem(url: summary.url)
+        let player = AVPlayer(playerItem: item)
+        playerView.playerLayer.player = player
+        self.player = player
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(playerItemDidFinish(_:)),
+            name: .AVPlayerItemDidPlayToEndTime,
+            object: item
+        )
+        addTimeObserver()
+
+        slider.value = 0
+        updateTimeLabel(current: .zero, duration: summary.duration)
+        updateMetadata(for: summary)
+        statusLabel.text = summary.kind.title
+
+        if autoplay {
+            player.play()
+            updatePlayButton(isPlaying: true)
+        } else {
+            updatePlayButton(isPlaying: false)
+        }
+    }
+
+    private func updateMetadata(for summary: VideoSummary) {
         metadataLabel.text = [
-            "Frame: \(summary.frameName)",
-            summary.cameraPositionText,
-            summary.cameraForwardText,
-            "Session: \(session.id)",
-            previewModeText()
+            "Preview: \(summary.kind.title)",
+            "File: \(summary.kind.relativePath)",
+            "Duration: \(format(seconds: summary.duration.seconds))",
+            String(format: "Size: %.0f x %.0f", summary.naturalSize.width, summary.naturalSize.height),
+            String(format: "FPS: %.2f", summary.frameRate),
+            "Bytes: \(summary.fileSize.map(String.init) ?? "unknown")",
+            "Session: \(session.id)"
         ].joined(separator: "\n")
-
-        if updateRealityCamera {
-            movePreviewCamera(to: summary.cameraPose, animatedDuration: cameraAnimationDuration)
-        }
     }
 
-    private func previewModeText() -> String {
-        if let usdzURL = findExistingUSDZURL() {
-            return "Preview: USDZ\nOutput: \(usdzURL.lastPathComponent)"
-        }
-        return "Preview: image"
-    }
-
-    private func previewImage(for summary: CaptureFrameSummary) -> UIImage? {
-        guard let ptsValue = summary.imagePTSValue,
-              let ptsTimescale = summary.imagePTSTimescale else {
-            return UIImage(contentsOfFile: summary.imageURL.path)
-        }
-
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: summary.imageURL))
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-
-        guard let cgImage = try? generator.copyCGImage(
-            at: CMTime(value: ptsValue, timescale: ptsTimescale),
-            actualTime: nil
-        ) else {
-            return nil
-        }
-        return UIImage(cgImage: cgImage)
-    }
-
-    @objc private func processPointCloud() {
-        stopPlayback(resetButton: true)
-        processButton.isEnabled = false
-        processButton.alpha = 0.55
-        latestResult = nil
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            do {
-                let result = try self.processor.process(session: self.session, outputFormat: .usdz) { message in
-                    DispatchQueue.main.async {
-                        self.statusLabel.text = message
-                    }
-                }
-                DispatchQueue.main.async {
-                    self.latestResult = result
-                    self.metadataLabel.text = [
-                        self.metadataLabel.text ?? "",
-                        "",
-                        "Processed frames: \(result.frameCount)",
-                        "Point count: \(result.pointCount)",
-                        "Output: \(result.outputURLs.map(\.lastPathComponent).joined(separator: ", "))"
-                    ].joined(separator: "\n")
-                    self.processButton.isEnabled = true
-                    self.processButton.alpha = 1
-                    self.updatePreviewIfNeeded(for: result)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.statusLabel.text = "Failed"
-                    self.processButton.isEnabled = true
-                    self.processButton.alpha = 1
-                    self.showAlert(title: "Process Failed", message: error.localizedDescription)
-                }
+    private func addTimeObserver() {
+        guard let player else { return }
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.05, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] time in
+            guard let self, !self.isScrubbing else { return }
+            let duration = self.player?.currentItem?.duration ?? .zero
+            let durationSeconds = duration.seconds
+            if durationSeconds.isFinite, durationSeconds > 0 {
+                self.slider.value = Float(time.seconds / durationSeconds)
             }
+            self.updateTimeLabel(current: time, duration: duration)
         }
+    }
+
+    private func removeTimeObserver() {
+        if let timeObserver {
+            player?.removeTimeObserver(timeObserver)
+        }
+        timeObserver = nil
+    }
+
+    @objc private func selectPreviewKind() {
+        guard let kind = PreviewKind(rawValue: previewControl.selectedSegmentIndex) else { return }
+        selectedKind = kind
+        loadSelectedVideo(autoplay: player?.timeControlStatus == .playing)
+    }
+
+    @objc private func togglePlayback() {
+        guard let player else { return }
+        if player.timeControlStatus == .playing {
+            player.pause()
+            updatePlayButton(isPlaying: false)
+        } else {
+            if let item = player.currentItem, item.currentTime() >= item.duration {
+                player.seek(to: .zero)
+            }
+            player.play()
+            updatePlayButton(isPlaying: true)
+        }
+    }
+
+    @objc private func beginScrubbing() {
+        isScrubbing = true
+    }
+
+    @objc private func updateScrubbing() {
+        guard let duration = player?.currentItem?.duration else { return }
+        let target = CMTime(seconds: Double(slider.value) * duration.seconds, preferredTimescale: 600)
+        updateTimeLabel(current: target, duration: duration)
+    }
+
+    @objc private func endScrubbing() {
+        guard let player, let duration = player.currentItem?.duration else {
+            isScrubbing = false
+            return
+        }
+        let target = CMTime(seconds: Double(slider.value) * duration.seconds, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            self?.isScrubbing = false
+        }
+    }
+
+    @objc private func playerItemDidFinish(_ notification: Notification) {
+        player?.seek(to: .zero)
+        updatePlayButton(isPlaying: false)
     }
 
     @objc private func shareCurrentOutput() {
-        stopPlayback(resetButton: true)
         let activityViewController = UIActivityViewController(
             activityItems: [session.url],
             applicationActivities: nil
@@ -336,553 +372,17 @@ final class CapturePreviewViewController: UIViewController {
         present(activityViewController, animated: true)
     }
 
-    private func updatePreviewIfNeeded(for result: CapturePointCloudResult) {
-        guard let usdzURL = result.outputURLs.first(where: { $0.pathExtension.lowercased() == "usdz" }) else {
-            return
-        }
-        showUSDZPreview(url: usdzURL)
+    private func updatePlayButton(isPlaying: Bool) {
+        playButton.setTitle(isPlaying ? "Pause" : "Play", for: .normal)
+        playButton.backgroundColor = isPlaying ? .systemOrange : .systemGreen
     }
 
-    private func findExistingUSDZURL() -> URL? {
-        let preferredURL = session.url
-            .appendingPathComponent("processed", isDirectory: true)
-            .appendingPathComponent("point_cloud.usdz")
-        if FileManager.default.fileExists(atPath: preferredURL.path) {
-            return preferredURL
-        }
-
-        guard let enumerator = FileManager.default.enumerator(
-            at: session.url,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-
-        var newestURL: URL?
-        var newestDate = Date.distantPast
-        for case let url as URL in enumerator where url.pathExtension.lowercased() == "usdz" {
-            guard
-                let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-                values.isRegularFile == true
-            else {
-                continue
-            }
-
-            let modificationDate = values.contentModificationDate ?? Date.distantPast
-            if newestURL == nil || modificationDate > newestDate {
-                newestURL = url
-                newestDate = modificationDate
-            }
-        }
-        return newestURL
+    private func updateTimeLabel(current: CMTime, duration: CMTime) {
+        timeLabel.text = "\(format(seconds: current.seconds)) / \(format(seconds: duration.seconds))"
     }
 
-    private func showUSDZPreview(url: URL) {
-        usdzLoadTask?.cancel()
-        loadingUSDZURL = url
-        statusLabel.text = "Loading USDZ"
-
-        usdzLoadTask = Task { [weak self] in
-            do {
-                let entity = try await Entity(contentsOf: url)
-                await MainActor.run {
-                    guard let self, self.loadingUSDZURL == url else { return }
-                    self.usdzLoadTask = nil
-                    self.loadingUSDZURL = nil
-                    self.configureRealityViewIfNeeded()
-                    self.displayRealityEntity(entity)
-                    self.imageView.isHidden = true
-                    self.sceneContainerView.isHidden = false
-                    self.statusLabel.text = "Ready"
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                await MainActor.run {
-                    guard let self, self.loadingUSDZURL == url else { return }
-                    self.usdzLoadTask = nil
-                    self.loadingUSDZURL = nil
-                    self.hideUSDZPreview()
-                    self.statusLabel.text = "Preview failed"
-                    self.showAlert(title: "USDZ Preview Failed", message: error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func hideUSDZPreview() {
-        stopPlayback(resetButton: true)
-        usdzLoadTask?.cancel()
-        usdzLoadTask = nil
-        loadingUSDZURL = nil
-        previewAnchor.map { realityView?.scene.removeAnchor($0) }
-        previewAnchor = nil
-        previewRootEntity = nil
-        previewContentEntity = nil
-        previewCamera = nil
-        imageView.isHidden = false
-        sceneContainerView.isHidden = true
-    }
-
-    private func configureRealityViewIfNeeded() {
-        guard realityView == nil else { return }
-
-        let view = ARView(
-            frame: .zero,
-            cameraMode: .nonAR,
-            automaticallyConfigureSession: false
-        )
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.backgroundColor = .black
-        view.environment.background = .color(.black)
-        view.automaticallyConfigureSession = false
-        view.cameraMode = .nonAR
-        view.renderOptions.insert(.disableCameraGrain)
-        view.renderOptions.insert(.disableAREnvironmentLighting)
-        view.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(handlePreviewPan(_:))))
-        view.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(handlePreviewPinch(_:))))
-        sceneContainerView.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: sceneContainerView.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: sceneContainerView.trailingAnchor),
-            view.topAnchor.constraint(equalTo: sceneContainerView.topAnchor),
-            view.bottomAnchor.constraint(equalTo: sceneContainerView.bottomAnchor)
-        ])
-        realityView = view
-    }
-
-    private func displayRealityEntity(_ entity: Entity) {
-        guard let realityView else { return }
-
-        previewAnchor.map { realityView.scene.removeAnchor($0) }
-
-        let anchor = AnchorEntity(world: .zero)
-        let root = Entity()
-        anchor.addChild(root)
-        root.addChild(entity)
-
-        let originalCenter = centerEntity(entity)
-        let radius = max(entity.visualBounds(recursive: true, relativeTo: root).boundingRadius, 0.1)
-        previewOriginalCenter = originalCenter
-        previewRadius = radius
-        previewScale = 1 / radius
-        previewYaw = 0
-        previewPitch = 0
-        previewCameraDistance = 3
-        updatePreviewRootTransform()
-
-        let camera = PerspectiveCamera()
-        camera.camera.fieldOfViewInDegrees = 55
-        configureDefaultPreviewCamera(camera, relativeTo: anchor)
-        anchor.addChild(camera)
-
-        let light = DirectionalLight()
-        light.light.intensity = 3000
-        light.look(at: .zero, from: SIMD3<Float>(0, 2, 3), relativeTo: anchor)
-        anchor.addChild(light)
-
-        realityView.scene.addAnchor(anchor)
-        previewAnchor = anchor
-        previewRootEntity = root
-        previewContentEntity = entity
-        previewCamera = camera
-    }
-
-    @discardableResult
-    private func centerEntity(_ entity: Entity) -> SIMD3<Float> {
-        let bounds = entity.visualBounds(recursive: true, relativeTo: nil)
-        guard !bounds.isEmpty else { return .zero }
-        entity.position -= bounds.center
-        return bounds.center
-    }
-
-    private func configureDefaultPreviewCamera(
-        _ camera: PerspectiveCamera,
-        relativeTo anchor: AnchorEntity
-    ) {
-        camera.look(
-            at: .zero,
-            from: SIMD3<Float>(0, 0, previewCameraDistance),
-            relativeTo: anchor
-        )
-    }
-
-    private func configurePreviewCamera(
-        _ camera: PerspectiveCamera,
-        previewPose: CaptureCameraPose?,
-        relativeTo anchor: AnchorEntity,
-        animatedDuration: TimeInterval = 0
-    ) {
-        guard let previewPose else {
-            camera.look(
-                at: .zero,
-                from: SIMD3<Float>(0, 0, previewCameraDistance),
-                relativeTo: anchor
-            )
-            return
-        }
-
-        let currentTransform = camera.transform
-        camera.look(
-            at: previewPose.position + previewPose.forward,
-            from: previewPose.position,
-            upVector: previewPose.up,
-            relativeTo: anchor
-        )
-        guard animatedDuration > 0 else { return }
-
-        let targetTransform = camera.transform
-        camera.transform = currentTransform
-        camera.move(
-            to: targetTransform,
-            relativeTo: camera.parent,
-            duration: animatedDuration,
-            timingFunction: .easeInOut
-        )
-    }
-
-    private func movePreviewCamera(to pose: CaptureCameraPose, animatedDuration: TimeInterval = 0) {
-        guard let previewCamera, let previewAnchor else { return }
-        let convertedPose = previewPose(from: pose)
-        configurePreviewCamera(
-            previewCamera,
-            previewPose: convertedPose,
-            relativeTo: previewAnchor,
-            animatedDuration: animatedDuration
-        )
-        if let convertedPose {
-            statusLabel.text = String(
-                format: "Camera %.2f %.2f %.2f",
-                convertedPose.position.x,
-                convertedPose.position.y,
-                convertedPose.position.z
-            )
-        }
-    }
-
-    private func previewPose(from pose: CaptureCameraPose?) -> CaptureCameraPose? {
-        guard let pose, simd_length(pose.forward) > 0.0001 else { return nil }
-
-        guard
-            let previewContentEntity,
-            let previewAnchor
-        else {
-            let rotation = currentPreviewRotation()
-            let centeredPosition = pose.position - previewOriginalCenter
-            let position = simd_act(rotation, centeredPosition * previewScale)
-            let forward = simd_act(rotation, simd_normalize(pose.forward))
-            let up = simd_length(pose.up) > 0.0001
-                ? simd_act(rotation, simd_normalize(pose.up))
-                : SIMD3<Float>(0, 1, 0)
-            return CaptureCameraPose(position: position, forward: forward, up: up)
-        }
-
-        let transform = previewContentEntity.transformMatrix(relativeTo: previewAnchor)
-        let position4 = transform * SIMD4<Float>(pose.position.x, pose.position.y, pose.position.z, 1)
-        let forward4 = transform * SIMD4<Float>(pose.forward.x, pose.forward.y, pose.forward.z, 0)
-        let up4 = transform * SIMD4<Float>(pose.up.x, pose.up.y, pose.up.z, 0)
-
-        let position = SIMD3<Float>(position4.x, position4.y, position4.z)
-        let forward = SIMD3<Float>(forward4.x, forward4.y, forward4.z)
-        let up = simd_length(pose.up) > 0.0001
-            ? SIMD3<Float>(up4.x, up4.y, up4.z)
-            : SIMD3<Float>(0, 1, 0)
-
-        guard simd_length(forward) > 0.0001 else { return nil }
-        return CaptureCameraPose(
-            position: position,
-            forward: simd_normalize(forward),
-            up: simd_length(up) > 0.0001 ? simd_normalize(up) : SIMD3<Float>(0, 1, 0)
-        )
-    }
-
-    private func currentPreviewRotation() -> simd_quatf {
-        let yawRotation = simd_quatf(angle: previewYaw, axis: SIMD3<Float>(0, 1, 0))
-        let pitchRotation = simd_quatf(angle: previewPitch, axis: SIMD3<Float>(1, 0, 0))
-        return yawRotation * pitchRotation
-    }
-
-    private func updatePreviewRootTransform() {
-        previewRootEntity?.transform = Transform(
-            scale: SIMD3<Float>(repeating: previewScale),
-            rotation: currentPreviewRotation(),
-            translation: .zero
-        )
-    }
-
-    @objc private func togglePlayback() {
-        if isPlaying {
-            stopPlayback(resetButton: true)
-        } else {
-            startPlayback()
-        }
-    }
-
-    private func startPlayback() {
-        guard frameSummaries.count > 1, let previewCamera else { return }
-
-        if selectedFrameIndex == nil || selectedFrameIndex == frameSummaries.count - 1 {
-            selectFrame(at: 0, updateRealityCamera: true)
-        }
-
-        let startIndex = selectedFrameIndex ?? 0
-        guard let component = makePlaybackComponent(startIndex: startIndex) else { return }
-        previewCamera.components[CameraPlaybackComponent.self] = component
-        isPlaying = true
-        playButton.setTitle("Pause", for: .normal)
-        playButton.backgroundColor = .systemOrange
-    }
-
-    private func stopPlayback(resetButton: Bool) {
-        isPlaying = false
-        previewCamera?.components[CameraPlaybackComponent.self]?.isPlaying = false
-        guard resetButton else { return }
-        playButton.setTitle("Play", for: .normal)
-        playButton.backgroundColor = .systemGreen
-    }
-
-    private func makePlaybackComponent(startIndex: Int) -> CameraPlaybackComponent? {
-        guard
-            let previewCamera,
-            let previewAnchor
-        else {
-            return nil
-        }
-
-        let originalTransform = previewCamera.transform
-        var keyframes: [CameraPlaybackKeyframe] = []
-        keyframes.reserveCapacity(frameSummaries.count)
-
-        for (index, summary) in frameSummaries.enumerated() {
-            guard let convertedPose = previewPose(from: summary.cameraPose) else { continue }
-            configurePreviewCamera(previewCamera, previewPose: convertedPose, relativeTo: previewAnchor)
-            keyframes.append(
-                CameraPlaybackKeyframe(
-                    time: TimeInterval(index) * playbackFrameDuration,
-                    frameIndex: index,
-                    transform: previewCamera.transform
-                )
-            )
-        }
-
-        previewCamera.transform = originalTransform
-        guard keyframes.count > 1 else { return nil }
-        if let firstKeyframe = keyframes.first {
-            keyframes.append(
-                CameraPlaybackKeyframe(
-                    time: TimeInterval(keyframes.count) * playbackFrameDuration,
-                    frameIndex: firstKeyframe.frameIndex,
-                    transform: firstKeyframe.transform
-                )
-            )
-        }
-
-        let startTime = keyframes.first(where: { $0.frameIndex == startIndex })?.time ?? keyframes[0].time
-        return CameraPlaybackComponent(
-            keyframes: keyframes,
-            elapsedTime: startTime,
-            isPlaying: true
-        )
-    }
-
-    @objc private func handlePreviewPan(_ recognizer: UIPanGestureRecognizer) {
-        guard previewRootEntity != nil else { return }
-        if recognizer.state == .began {
-            stopPlayback(resetButton: true)
-        }
-
-        let translation = recognizer.translation(in: sceneContainerView)
-        previewYaw += Float(translation.x) * 0.008
-        previewPitch += Float(translation.y) * 0.008
-        previewPitch = min(max(previewPitch, -.pi / 2), .pi / 2)
-        recognizer.setTranslation(.zero, in: sceneContainerView)
-        updatePreviewRootTransform()
-    }
-
-    @objc private func handlePreviewPinch(_ recognizer: UIPinchGestureRecognizer) {
-        guard previewRootEntity != nil else { return }
-        if recognizer.state == .began {
-            stopPlayback(resetButton: true)
-        }
-
-        previewScale *= Float(recognizer.scale)
-        previewScale = min(max(previewScale, 0.05), 100)
-        recognizer.scale = 1
-        updatePreviewRootTransform()
-    }
-
-    private func showAlert(title: String, message: String) {
-        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
-    }
-}
-
-extension CapturePreviewViewController: UICollectionViewDataSource, UICollectionViewDelegate {
-    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        frameSummaries.count
-    }
-
-    func collectionView(
-        _ collectionView: UICollectionView,
-        cellForItemAt indexPath: IndexPath
-    ) -> UICollectionViewCell {
-        let cell = collectionView.dequeueReusableCell(
-            withReuseIdentifier: CaptureFrameThumbnailCell.reuseIdentifier,
-            for: indexPath
-        )
-        guard let thumbnailCell = cell as? CaptureFrameThumbnailCell else { return cell }
-        thumbnailCell.configure(with: frameSummaries[indexPath.item].imageURL)
-        return thumbnailCell
-    }
-
-    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        selectFrame(at: indexPath.item, resetPlayback: true)
-    }
-}
-
-private enum CameraPlaybackRuntime {
-    private static var isRegistered = false
-
-    static func registerIfNeeded() {
-        guard !isRegistered else { return }
-        CameraPlaybackComponent.registerComponent()
-        CameraPlaybackSystem.registerSystem()
-        isRegistered = true
-    }
-}
-
-private struct CameraPlaybackKeyframe {
-    let time: TimeInterval
-    let frameIndex: Int
-    let transform: Transform
-}
-
-private struct CameraPlaybackComponent: Component {
-    var keyframes: [CameraPlaybackKeyframe]
-    var elapsedTime: TimeInterval
-    var isPlaying: Bool
-}
-
-private struct CameraPlaybackSystem: System {
-    private static let query = EntityQuery(where: .has(CameraPlaybackComponent.self))
-
-    init(scene: Scene) {}
-
-    func update(context: SceneUpdateContext) {
-        for entity in context.entities(matching: Self.query, updatingSystemWhen: .rendering) {
-            guard
-                var component = entity.components[CameraPlaybackComponent.self],
-                component.isPlaying,
-                component.keyframes.count > 1,
-                let lastTime = component.keyframes.last?.time,
-                lastTime > 0
-            else {
-                continue
-            }
-
-            component.elapsedTime += context.deltaTime
-            if component.elapsedTime > lastTime {
-                component.elapsedTime = component.elapsedTime.truncatingRemainder(dividingBy: lastTime)
-            }
-
-            entity.transform = interpolatedTransform(
-                at: component.elapsedTime,
-                keyframes: component.keyframes
-            )
-            entity.components[CameraPlaybackComponent.self] = component
-        }
-    }
-
-    private func interpolatedTransform(
-        at time: TimeInterval,
-        keyframes: [CameraPlaybackKeyframe]
-    ) -> Transform {
-        guard let first = keyframes.first else { return Transform() }
-        guard let nextIndex = keyframes.firstIndex(where: { $0.time >= time }) else {
-            return keyframes.last?.transform ?? first.transform
-        }
-
-        if nextIndex == 0 {
-            return first.transform
-        }
-
-        let previous = keyframes[nextIndex - 1]
-        let next = keyframes[nextIndex]
-        let duration = max(next.time - previous.time, 0.0001)
-        let t = Float(min(max((time - previous.time) / duration, 0), 1))
-        return Transform(
-            scale: mix(previous.transform.scale, next.transform.scale, t),
-            rotation: simd_slerp(previous.transform.rotation, next.transform.rotation, t),
-            translation: mix(previous.transform.translation, next.transform.translation, t)
-        )
-    }
-
-    private func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
-        a * (1 - t) + b * t
-    }
-}
-
-private final class CaptureFrameThumbnailCell: UICollectionViewCell {
-    static let reuseIdentifier = "CaptureFrameThumbnailCell"
-
-    private let imageView = UIImageView()
-    private var representedURL: URL?
-
-    override var isSelected: Bool {
-        didSet {
-            contentView.layer.borderColor = (isSelected ? UIColor.systemGreen : UIColor.clear).cgColor
-            contentView.layer.borderWidth = isSelected ? 3 : 0
-        }
-    }
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-
-        contentView.backgroundColor = .secondarySystemBackground
-        contentView.layer.cornerRadius = 6
-        contentView.layer.masksToBounds = true
-
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.contentMode = .scaleAspectFill
-        imageView.clipsToBounds = true
-        contentView.addSubview(imageView)
-
-        NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            imageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            imageView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            imageView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        representedURL = nil
-        imageView.sd_cancelCurrentImageLoad()
-        imageView.image = nil
-    }
-
-    func configure(with imageURL: URL) {
-        representedURL = imageURL
-        let targetSize = CGSize(width: 144, height: 108)
-        imageView.sd_setImage(
-            with: imageURL,
-            placeholderImage: nil,
-            options: [.scaleDownLargeImages],
-            context: [.imageThumbnailPixelSize: targetSize]
-        )
-    }
-}
-
-private extension Array {
-    subscript(safe index: Int) -> Element? {
-        indices.contains(index) ? self[index] : nil
+    private func format(seconds: Double) -> String {
+        guard seconds.isFinite else { return "0.00" }
+        return String(format: "%.2f", max(0, seconds))
     }
 }
