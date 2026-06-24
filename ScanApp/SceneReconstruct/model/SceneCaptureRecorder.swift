@@ -6,36 +6,32 @@
 //
 
 import ARKit
-import CoreImage
+import AVFoundation
+import CoreMedia
 import Foundation
 import simd
-import UIKit
 
 final class SceneCaptureRecorder {
     private let writerQueue = DispatchQueue(label: "dokidoki.ScanApp.sceneCaptureWriter", qos: .utility)
-    private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
-    private let ciContext = CIContext(options: [.cacheIntermediates: false])
-    private let jpegCompressionQuality: CGFloat = 0.92
-    private let minCaptureInterval: TimeInterval = 0.45 / 8.0
-    private let minTranslationDelta: Float = 0.05 / 8.0
-    private let minRotationDeltaRadians: Float = (7 * .pi / 180) / 8
     private let maxVelocity: Float = 0.5
     private let maxAngularVelocity: Float = 0.7
-    private let maxPendingWrites = 8
+    private let rgbVideoRelativePath = "rgb.mov"
+    private let depthPackedVideoRelativePath = "depth/depth_packed_hevc.mov"
+    private let rgbVideoTimescale: CMTimeScale = 600
 
     private var sessionDirectory: URL?
-    private var imageDirectory: URL?
     private var metadataDirectory: URL?
     private var depthDirectory: URL?
+    private var metadataWriter: JsonlSegmentWriter?
+    private var rgbVideoWriter: RGBVideoWriter?
+    private var depthPackedVideoWriter: DepthPackedVideoWriter?
     private var isRecording = false
     private var frameIndex = 0
     private var savedImageCount = 0
     private var savedDepthFrameCount = 0
     private var pendingWriteCount = 0
-    private var acceptedCaptureCount = 0
     private var recordingGeneration = 0
-    private var lastSavedTimestamp: TimeInterval?
-    private var lastSavedTransform: simd_float4x4?
+    private var firstFrameTimestamp: TimeInterval?
     private var previousFrameTimestamp: TimeInterval?
     private var previousFrameTransform: simd_float4x4?
     private var lastDecision = "Recorder idle"
@@ -51,50 +47,62 @@ final class SceneCaptureRecorder {
     }
 
     func start(sessionDirectory: URL) throws {
+        writerQueue.sync {
+            closeMetadataWriter()
+            finishRGBVideoWriter()
+            finishDepthPackedVideoWriter()
+        }
+
         self.sessionDirectory = sessionDirectory
-        imageDirectory = sessionDirectory.appendingPathComponent("images", isDirectory: true)
         metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
         depthDirectory = sessionDirectory.appendingPathComponent("depth", isDirectory: true)
 
-        try FileManager.default.createDirectory(at: imageDirectory!, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: metadataDirectory!, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: depthDirectory!, withIntermediateDirectories: true)
+        metadataWriter = try JsonlSegmentWriter(directory: metadataDirectory!)
 
         isRecording = true
         recordingGeneration += 1
-        lastDecision = "Recorder started + depth"
-        prepareCaptureHaptic()
+        firstFrameTimestamp = nil
+        lastDecision = "Recorder started + RGB video + depth"
     }
 
     func stop() {
         isRecording = false
         lastDecision = "Recorder stopped"
+        writerQueue.async { [weak self] in
+            self?.closeMetadataWriter()
+            self?.finishRGBVideoWriter()
+            self?.finishDepthPackedVideoWriter()
+        }
     }
 
     func reset() {
         isRecording = false
         sessionDirectory = nil
-        imageDirectory = nil
         metadataDirectory = nil
         depthDirectory = nil
         frameIndex = 0
         savedImageCount = 0
         savedDepthFrameCount = 0
         pendingWriteCount = 0
-        acceptedCaptureCount = 0
         recordingGeneration += 1
-        lastSavedTimestamp = nil
-        lastSavedTransform = nil
+        firstFrameTimestamp = nil
         previousFrameTimestamp = nil
         previousFrameTransform = nil
         lastDecision = "Recorder reset"
+        writerQueue.async { [weak self] in
+            self?.closeMetadataWriter()
+            self?.finishRGBVideoWriter()
+            self?.finishDepthPackedVideoWriter()
+        }
     }
 
     func process(frame: ARFrame, interfaceOrientation: UIInterfaceOrientation) {
         frameIndex += 1
 
         guard isRecording else { return }
-        guard let imageDirectory, let metadataDirectory else {
+        guard let sessionDirectory, metadataWriter != nil else {
             lastDecision = "Missing dataset directory"
             return
         }
@@ -104,29 +112,19 @@ final class SceneCaptureRecorder {
         }
 
         let motion = estimateMotion(for: frame)
-        let decision = shouldCapture(frame: frame, motion: motion)
-        guard decision.shouldCapture else {
-            lastDecision = decision.reason
-            return
-        }
-
-        guard pendingWriteCount < maxPendingWrites else {
-            lastDecision = "Skipped: writer queue busy"
-            return
-        }
-
         let frameName = String(format: "frame_%06d", frameIndex)
-        let imageName = "\(frameName).jpg"
-        let metadataName = "\(frameName).json"
-        let imageURL = imageDirectory.appendingPathComponent(imageName)
-        let metadataURL = metadataDirectory.appendingPathComponent(metadataName)
         let depthSnapshot = makeDepthSnapshot(from: frame, frameName: frameName)
         let pixelBuffer = frame.capturedImage
+
         let camera = frame.camera
         let cameraTransform = camera.transform
         let worldToCamera = cameraTransform.inverse
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let firstTimestamp = firstFrameTimestamp ?? frame.timestamp
+        firstFrameTimestamp = firstTimestamp
+        let sessionTime = frame.timestamp - firstTimestamp
+        let rgbPresentationTime = CMTime(seconds: sessionTime, preferredTimescale: rgbVideoTimescale)
         let projection = camera.projectionMatrix(
             for: .landscapeRight,
             viewportSize: CGSize(width: CGFloat(width), height: CGFloat(height)),
@@ -136,13 +134,15 @@ final class SceneCaptureRecorder {
 
         let snapshot = SceneCaptureFrameSnapshot(
             pixelBuffer: pixelBuffer,
-            imageURL: imageURL,
-            imageRelativePath: "images/\(imageName)",
             frameIndex: frameIndex,
             frameName: frameName,
-            metadataRelativePath: "metadata/\(metadataName)",
-            metadataURL: metadataURL,
             timestamp: frame.timestamp,
+            sessionTime: sessionTime,
+            rgbURL: sessionDirectory.appendingPathComponent(rgbVideoRelativePath),
+            rgbRelativePath: rgbVideoRelativePath,
+            rgbPresentationTime: rgbPresentationTime,
+            depthVideoURL: sessionDirectory.appendingPathComponent(depthPackedVideoRelativePath),
+            depthVideoRelativePath: depthPackedVideoRelativePath,
             width: width,
             height: height,
             interfaceOrientationName: interfaceOrientation.metadataName,
@@ -158,43 +158,9 @@ final class SceneCaptureRecorder {
         )
 
         pendingWriteCount += 1
-        acceptedCaptureCount += 1
-        lastSavedTimestamp = frame.timestamp
-        lastSavedTransform = cameraTransform
-        lastDecision = "Queued \(frameName)"
+        lastDecision = "Queued \(frameName) video frame"
 
         enqueueCaptureWrite(snapshot: snapshot, generation: recordingGeneration)
-    }
-
-    private func shouldCapture(frame: ARFrame, motion: FrameMotion) -> (shouldCapture: Bool, reason: String) {
-        guard case .normal = frame.camera.trackingState else {
-            return (false, "Skipped: tracking not normal")
-        }
-
-        if acceptedCaptureCount == 0 {
-            return (true, "Capture: first frame")
-        }
-
-        if let lastSavedTimestamp, frame.timestamp - lastSavedTimestamp < minCaptureInterval {
-            return (false, "Skipped: waiting for interval")
-        }
-
-        if motion.velocity > maxVelocity {
-            return (false, String(format: "Skipped: velocity %.2f", motion.velocity))
-        }
-
-        if motion.angularVelocity > maxAngularVelocity {
-            return (false, String(format: "Skipped: angular %.2f", motion.angularVelocity))
-        }
-
-        let translationDelta = lastSavedTransform.map { distanceBetweenTranslations(frame.camera.transform, $0) } ?? .greatestFiniteMagnitude
-        let rotationDelta = lastSavedTransform.map { rotationAngleBetween(frame.camera.transform, $0) } ?? .greatestFiniteMagnitude
-
-        if translationDelta < minTranslationDelta && rotationDelta < minRotationDeltaRadians {
-            return (false, "Skipped: viewpoint too similar")
-        }
-
-        return (true, "Capture: keyframe")
     }
 
     private func estimateMotion(for frame: ARFrame) -> FrameMotion {
@@ -225,7 +191,8 @@ final class SceneCaptureRecorder {
     private func enqueueCaptureWrite(snapshot: SceneCaptureFrameSnapshot, generation: Int) {
         writerQueue.async { [weak self] in
             let result = Result<Void, Error> {
-                try self?.writeImageDepthAndMetadata(snapshot)
+                guard let self else { return }
+                try self.writeFrameAssets(snapshot)
             }
 
             DispatchQueue.main.async {
@@ -240,30 +207,32 @@ final class SceneCaptureRecorder {
         }
     }
 
-    private func writeImageDepthAndMetadata(_ snapshot: SceneCaptureFrameSnapshot) throws {
-        let image = CIImage(cvPixelBuffer: snapshot.pixelBuffer)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        try ciContext.writeJPEGRepresentation(
-            of: image,
-            to: snapshot.imageURL,
-            colorSpace: colorSpace,
-            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegCompressionQuality]
-        )
-
-        let metadata = makeMetadata(from: snapshot)
-        try writeDepthDataIfNeeded(snapshot.depthSnapshot)
-        let metadataData = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
-        try metadataData.write(to: snapshot.metadataURL, options: .atomic)
+    private func writeFrameAssets(_ snapshot: SceneCaptureFrameSnapshot) throws {
+        let rgbWriter = try rgbVideoWriter(for: snapshot)
+        try rgbWriter.append(snapshot.pixelBuffer, presentationTime: snapshot.rgbPresentationTime)
+        let depthVideoFrameInfo = try writeDepthPackedVideoIfNeeded(snapshot)
+        try writeConfidenceDataIfNeeded(snapshot.depthSnapshot)
+        try metadataWriter?.append(makeMetadata(from: snapshot, depthVideoFrameInfo: depthVideoFrameInfo))
     }
 
-    private func makeMetadata(from snapshot: SceneCaptureFrameSnapshot) -> [String: Any] {
+    private func makeMetadata(
+        from snapshot: SceneCaptureFrameSnapshot,
+        depthVideoFrameInfo: DepthPackedVideoFrameInfo?
+    ) -> [String: Any] {
         var metadata: [String: Any] = [
             "frame_index": snapshot.frameIndex,
             "frame_name": snapshot.frameName,
             "time": snapshot.timestamp,
-            "image": snapshot.imageRelativePath,
-            "metadata": snapshot.metadataRelativePath,
-            "capture_output": "images",
+            "arkit_timestamp": snapshot.timestamp,
+            "session_time": snapshot.sessionTime,
+            "image": snapshot.rgbRelativePath,
+            "capture_output": "rgb_video",
+            "rgb": [
+                "path": snapshot.rgbRelativePath,
+                "pts_seconds": snapshot.rgbPresentationTime.seconds,
+                "pts_value": snapshot.rgbPresentationTime.value,
+                "pts_timescale": snapshot.rgbPresentationTime.timescale
+            ],
             "image_orientation": "landscapeRight",
             "projection_orientation": "landscapeRight",
             "required_orientation": "landscapeRight",
@@ -282,19 +251,31 @@ final class SceneCaptureRecorder {
             "trackingState": snapshot.trackingStateText
         ]
 
-        if let depthSnapshot = snapshot.depthSnapshot {
-            var depthMetadata: [String: Any] = [
-                "format": "float32_little_endian",
-                "path": depthSnapshot.depthRelativePath,
+        if let depthSnapshot = snapshot.depthSnapshot,
+           let confidenceRelativePath = depthSnapshot.confidenceRelativePath {
+            metadata["confidence"] = [
+                "path": confidenceRelativePath,
+                "format": "uint8",
+                "timestamp": snapshot.timestamp,
                 "width": depthSnapshot.width,
-                "height": depthSnapshot.height,
-                "bytes_per_value": MemoryLayout<Float>.size
+                "height": depthSnapshot.height
             ]
-            if let confidenceRelativePath = depthSnapshot.confidenceRelativePath {
-                depthMetadata["confidence_path"] = confidenceRelativePath
-                depthMetadata["confidence_format"] = "uint8"
-            }
-            metadata["depth"] = depthMetadata
+        }
+
+        if let depthVideoFrameInfo {
+            metadata["depth_video"] = [
+                "path": depthVideoFrameInfo.path,
+                "encoding": depthVideoFrameInfo.encoding,
+                "codec": depthVideoFrameInfo.codec,
+                "min_depth": depthVideoFrameInfo.minDepth,
+                "max_depth": depthVideoFrameInfo.maxDepth,
+                "invalid_value": depthVideoFrameInfo.invalidValue,
+                "width": depthVideoFrameInfo.width,
+                "height": depthVideoFrameInfo.height,
+                "pts_seconds": depthVideoFrameInfo.ptsSeconds,
+                "pts_value": depthVideoFrameInfo.ptsValue,
+                "pts_timescale": depthVideoFrameInfo.ptsTimescale
+            ]
         }
 
         return metadata
@@ -321,9 +302,46 @@ final class SceneCaptureRecorder {
         )
     }
 
-    private func writeDepthDataIfNeeded(_ snapshot: SceneDepthFrameSnapshot?) throws {
+    private func rgbVideoWriter(for snapshot: SceneCaptureFrameSnapshot) throws -> RGBVideoWriter {
+        if let rgbVideoWriter {
+            return rgbVideoWriter
+        }
+
+        let writer = try RGBVideoWriter(
+            url: snapshot.rgbURL,
+            width: snapshot.width,
+            height: snapshot.height
+        )
+        rgbVideoWriter = writer
+        return writer
+    }
+
+    private func writeDepthPackedVideoIfNeeded(_ snapshot: SceneCaptureFrameSnapshot) throws -> DepthPackedVideoFrameInfo? {
+        guard let depthSnapshot = snapshot.depthSnapshot else { return nil }
+        let writer = try depthPackedVideoWriter(for: snapshot, depthSnapshot: depthSnapshot)
+        return try writer.append(depthSnapshot.depthMap, presentationTime: snapshot.rgbPresentationTime)
+    }
+
+    private func depthPackedVideoWriter(
+        for snapshot: SceneCaptureFrameSnapshot,
+        depthSnapshot: SceneDepthFrameSnapshot
+    ) throws -> DepthPackedVideoWriter {
+        if let depthPackedVideoWriter {
+            return depthPackedVideoWriter
+        }
+
+        let writer = try DepthPackedVideoWriter(
+            url: snapshot.depthVideoURL,
+            relativePath: snapshot.depthVideoRelativePath,
+            width: depthSnapshot.width,
+            height: depthSnapshot.height
+        )
+        depthPackedVideoWriter = writer
+        return writer
+    }
+
+    private func writeConfidenceDataIfNeeded(_ snapshot: SceneDepthFrameSnapshot?) throws {
         guard let snapshot else { return }
-        try writeFloat32PixelBuffer(snapshot.depthMap, to: snapshot.depthURL)
         if let confidenceMap = snapshot.confidenceMap, let confidenceURL = snapshot.confidenceURL {
             try writeUInt8PixelBuffer(confidenceMap, to: confidenceURL)
         }
@@ -347,24 +365,27 @@ final class SceneCaptureRecorder {
                 savedDepthFrameCount += 1
             }
             lastDecision = "Saved \(frameName)"
-            notifyCaptureSaved()
             onCaptureSaved?(SavedSceneCapture(imageName: frameName, cameraTransform: cameraTransform))
         case .failure(let error):
             lastDecision = "Save failed: \(error.localizedDescription)"
         }
     }
 
-    private func prepareCaptureHaptic() {
-        DispatchQueue.main.async { [hapticGenerator] in
-            hapticGenerator.prepare()
-        }
+    private func closeMetadataWriter() {
+        try? metadataWriter?.close()
+        metadataWriter = nil
     }
 
-    private func notifyCaptureSaved() {
-        DispatchQueue.main.async { [hapticGenerator] in
-            hapticGenerator.impactOccurred(intensity: 0.45)
-            hapticGenerator.prepare()
-        }
+    private func finishRGBVideoWriter() {
+        let writer = rgbVideoWriter
+        rgbVideoWriter = nil
+        writer?.finish {}
+    }
+
+    private func finishDepthPackedVideoWriter() {
+        let writer = depthPackedVideoWriter
+        depthPackedVideoWriter = nil
+        writer?.finish {}
     }
 }
 

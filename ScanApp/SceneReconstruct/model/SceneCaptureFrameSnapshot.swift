@@ -6,19 +6,22 @@
 //
 
 import ARKit
+import CoreMedia
 import CoreVideo
 import Foundation
 import simd
 
 struct SceneCaptureFrameSnapshot {
     let pixelBuffer: CVPixelBuffer
-    let imageURL: URL
-    let imageRelativePath: String
     let frameIndex: Int
     let frameName: String
-    let metadataRelativePath: String
-    let metadataURL: URL
     let timestamp: TimeInterval
+    let sessionTime: TimeInterval
+    let rgbURL: URL
+    let rgbRelativePath: String
+    let rgbPresentationTime: CMTime
+    let depthVideoURL: URL
+    let depthVideoRelativePath: String
     let width: Int
     let height: Int
     let interfaceOrientationName: String

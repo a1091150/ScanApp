@@ -54,10 +54,12 @@ final class SceneReconstructionScanViewModel {
             "projection_orientation": "landscapeRight",
             "required_orientation": "landscapeRight",
             "records_depth_data": true,
+            "records_depth_bin": false,
+            "capture_format": "arkit_rgb_video_jsonl_v1",
             "dataset_layout": [
-                "images": "images/frame_000001.jpg",
-                "metadata": "metadata/frame_000001.json",
-                "depth": "depth/frame_000001_depth_f32.bin",
+                "rgb": "rgb.mov",
+                "metadata": "metadata/frames_0000.jsonl",
+                "depth_video": "depth/depth_packed_hevc.mov",
                 "confidence": "depth/frame_000001_confidence_u8.bin"
             ]
         ]

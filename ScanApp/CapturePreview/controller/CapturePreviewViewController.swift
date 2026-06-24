@@ -5,6 +5,8 @@
 //  Created by Codex on 2026/6/18.
 //
 
+import AVFoundation
+import CoreMedia
 import UIKit
 import RealityKit
 import SDWebImage
@@ -238,7 +240,7 @@ final class CapturePreviewViewController: UIViewController {
         selectedFrameIndex = index
         let summary = frameSummaries[index]
         if sceneContainerView.isHidden {
-            imageView.image = UIImage(contentsOfFile: summary.imageURL.path)
+            imageView.image = previewImage(for: summary)
         }
         framesCollectionView.selectItem(
             at: IndexPath(item: index, section: 0),
@@ -264,6 +266,26 @@ final class CapturePreviewViewController: UIViewController {
             return "Preview: USDZ\nOutput: \(usdzURL.lastPathComponent)"
         }
         return "Preview: image"
+    }
+
+    private func previewImage(for summary: CaptureFrameSummary) -> UIImage? {
+        guard let ptsValue = summary.imagePTSValue,
+              let ptsTimescale = summary.imagePTSTimescale else {
+            return UIImage(contentsOfFile: summary.imageURL.path)
+        }
+
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: summary.imageURL))
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+
+        guard let cgImage = try? generator.copyCGImage(
+            at: CMTime(value: ptsValue, timescale: ptsTimescale),
+            actualTime: nil
+        ) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
     }
 
     @objc private func processPointCloud() {

@@ -5,7 +5,9 @@
 //  Created by Codex on 2026/6/18.
 //
 
+import AVFoundation
 import CoreGraphics
+import CoreMedia
 import Foundation
 import UIKit
 
@@ -34,12 +36,14 @@ final class CapturePointCloudProcessor {
     private let minimumDepthDiscontinuityThreshold: Float = 0.04
     private let relativeDepthDiscontinuityThreshold: Float = 0.08
     private let usdzBillboardSize: Float = 0.012
+    private var depthVideoReaders: [String: DepthVideoFrameReader] = [:]
 
     func process(
         session: CapturedScanSession,
         outputFormat: CapturePointCloudOutputFormat,
         status: @escaping (String) -> Void
     ) throws -> CapturePointCloudResult {
+        depthVideoReaders.removeAll()
         status("Loading metadata")
         let frames = try loadFrames(from: session.url)
         guard !frames.isEmpty else {
@@ -120,6 +124,8 @@ final class CapturePointCloudProcessor {
         return CaptureFrameSummary(
             frameName: frame.frameName,
             imageURL: sessionURL.appendingPathComponent(frame.imagePath),
+            imagePTSValue: frame.rgbPTSValue,
+            imagePTSTimescale: frame.rgbPTSTimescale,
             cameraPositionText: String(
                 format: "Camera position: %.3f, %.3f, %.3f",
                 cameraPosition.x,
@@ -147,36 +153,82 @@ final class CapturePointCloudProcessor {
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
+
+        let jsonlURLs = urls
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        if !jsonlURLs.isEmpty {
+            return try jsonlURLs.flatMap(loadFrameMetadataLines(from:))
+        }
+
+        let jsonURLs = urls
         .filter { $0.pathExtension == "json" }
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
-        return try urls.map(loadFrameMetadata(from:))
+        return try jsonURLs.map(loadFrameMetadata(from:))
+    }
+
+    private func loadFrameMetadataLines(from url: URL) throws -> [CaptureFrameMetadata] {
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CapturePreviewError.invalidMetadata(url.lastPathComponent)
+        }
+
+        return try text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { line in
+                let data = Data(line.utf8)
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw CapturePreviewError.invalidMetadata(url.lastPathComponent)
+                }
+                return try loadFrameMetadata(from: object, name: url.lastPathComponent)
+            }
     }
 
     private func loadFrameMetadata(from url: URL) throws -> CaptureFrameMetadata {
         let data = try Data(contentsOf: url)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let frameName = object["frame_name"] as? String,
-              let imagePath = object["image"] as? String,
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CapturePreviewError.invalidMetadata(url.lastPathComponent)
+        }
+        return try loadFrameMetadata(from: object, name: url.lastPathComponent)
+    }
+
+    private func loadFrameMetadata(from object: [String: Any], name: String) throws -> CaptureFrameMetadata {
+        let rgb = object["rgb"] as? [String: Any]
+        let depth = object["depth"] as? [String: Any]
+        let depthVideo = object["depth_video"] as? [String: Any]
+        guard let frameName = object["frame_name"] as? String,
+              let imagePath = (object["image"] as? String) ?? (rgb?["path"] as? String),
               let width = object["width"] as? Int,
               let height = object["height"] as? Int,
               let intrinsics = object["intrinsics"] as? [NSNumber],
-              let cameraToWorld = object["camera_to_world"] as? [NSNumber],
-              let depth = object["depth"] as? [String: Any],
-              let depthPath = depth["path"] as? String,
-              let depthWidth = depth["width"] as? Int,
-              let depthHeight = depth["height"] as? Int else {
-            throw CapturePreviewError.invalidMetadata(url.lastPathComponent)
+              let cameraToWorld = object["camera_to_world"] as? [NSNumber] else {
+            throw CapturePreviewError.invalidMetadata(name)
+        }
+        let depthPath = depth?["path"] as? String
+        let depthVideoPath = depthVideo?["path"] as? String
+        let depthWidth = (depth?["width"] as? Int) ?? (depthVideo?["width"] as? Int)
+        let depthHeight = (depth?["height"] as? Int) ?? (depthVideo?["height"] as? Int)
+        guard let depthWidth, let depthHeight, depthPath != nil || depthVideoPath != nil else {
+            throw CapturePreviewError.invalidMetadata(name)
         }
 
         return CaptureFrameMetadata(
             frameName: frameName,
             imagePath: imagePath,
+            rgbPTSValue: (rgb?["pts_value"] as? NSNumber)?.int64Value,
+            rgbPTSTimescale: (rgb?["pts_timescale"] as? NSNumber)?.int32Value,
             imageWidth: width,
             imageHeight: height,
             intrinsics: intrinsics.map(\.floatValue),
             cameraToWorld: cameraToWorld.map(\.floatValue),
             depthPath: depthPath,
+            depthVideoPath: depthVideoPath,
+            depthVideoPTSValue: (depthVideo?["pts_value"] as? NSNumber)?.int64Value,
+            depthVideoPTSTimescale: (depthVideo?["pts_timescale"] as? NSNumber)?.int32Value,
+            depthVideoMinDepth: (depthVideo?["min_depth"] as? NSNumber)?.floatValue,
+            depthVideoMaxDepth: (depthVideo?["max_depth"] as? NSNumber)?.floatValue,
+            depthVideoInvalidValue: (depthVideo?["invalid_value"] as? NSNumber)?.uint16Value,
             depthWidth: depthWidth,
             depthHeight: depthHeight
         )
@@ -188,9 +240,8 @@ final class CapturePointCloudProcessor {
         targetPointCount: Int
     ) throws -> [ColoredPoint] {
         let imageURL = sessionURL.appendingPathComponent(frame.imagePath)
-        let depthURL = sessionURL.appendingPathComponent(frame.depthPath)
-        let image = try RGBAImage(url: imageURL)
-        let depthValues = try readDepthValues(url: depthURL, expectedCount: frame.depthWidth * frame.depthHeight)
+        let image = try makeRGBAImage(from: frame, url: imageURL)
+        let depthValues = try loadDepthValues(from: frame, sessionURL: sessionURL)
 
         let step = samplingStep(for: frame, targetPointCount: targetPointCount)
         let sx = Float(frame.depthWidth) / Float(frame.imageWidth)
@@ -220,6 +271,17 @@ final class CapturePointCloudProcessor {
         return points
     }
 
+    private func makeRGBAImage(from frame: CaptureFrameMetadata, url: URL) throws -> RGBAImage {
+        guard let ptsValue = frame.rgbPTSValue, let ptsTimescale = frame.rgbPTSTimescale else {
+            return try RGBAImage(url: url)
+        }
+
+        return try RGBAImage(
+            videoURL: url,
+            time: CMTime(value: ptsValue, timescale: ptsTimescale)
+        )
+    }
+
     private func targetPointCountPerFrame(frameCount: Int) -> Int {
         max(1, Int(ceil(Double(maxSampledPointCount) / Double(max(1, frameCount)))))
     }
@@ -244,6 +306,40 @@ final class CapturePointCloudProcessor {
             data.copyBytes(to: destination, count: expectedCount * MemoryLayout<Float>.size)
         }
         return values
+    }
+
+    private func loadDepthValues(from frame: CaptureFrameMetadata, sessionURL: URL) throws -> [Float] {
+        if let depthPath = frame.depthPath {
+            let depthURL = sessionURL.appendingPathComponent(depthPath)
+            return try readDepthValues(url: depthURL, expectedCount: frame.depthWidth * frame.depthHeight)
+        }
+
+        guard let depthVideoPath = frame.depthVideoPath,
+              let ptsValue = frame.depthVideoPTSValue,
+              let ptsTimescale = frame.depthVideoPTSTimescale,
+              let minDepth = frame.depthVideoMinDepth,
+              let maxDepth = frame.depthVideoMaxDepth else {
+            throw CapturePreviewError.invalidDepth(frame.frameName)
+        }
+
+        let reader = try depthVideoReader(path: depthVideoPath, sessionURL: sessionURL)
+        return try reader.depthValues(
+            at: CMTime(value: ptsValue, timescale: ptsTimescale),
+            expectedWidth: frame.depthWidth,
+            expectedHeight: frame.depthHeight,
+            minDepth: minDepth,
+            maxDepth: maxDepth,
+            invalidValue: frame.depthVideoInvalidValue ?? 0
+        )
+    }
+
+    private func depthVideoReader(path: String, sessionURL: URL) throws -> DepthVideoFrameReader {
+        if let reader = depthVideoReaders[path] {
+            return reader
+        }
+        let reader = try DepthVideoFrameReader(url: sessionURL.appendingPathComponent(path))
+        depthVideoReaders[path] = reader
+        return reader
     }
 
     private func transformPoint(_ point: [Float], by matrix: [Float]) -> [Float] {
@@ -450,8 +546,7 @@ final class CapturePointCloudProcessor {
         targetPointCount: Int,
         vertices: inout [USDZMeshVertex]
     ) throws -> [UInt32] {
-        let depthURL = sessionURL.appendingPathComponent(frame.depthPath)
-        let depthValues = try readDepthValues(url: depthURL, expectedCount: frame.depthWidth * frame.depthHeight)
+        let depthValues = try loadDepthValues(from: frame, sessionURL: sessionURL)
         let step = samplingStep(for: frame, targetPointCount: targetPointCount)
         let sampledX = Array(stride(from: 0, to: frame.depthWidth, by: step))
         let sampledY = Array(stride(from: 0, to: frame.depthHeight, by: step))
@@ -721,6 +816,8 @@ final class CapturePointCloudProcessor {
 struct CaptureFrameSummary {
     let frameName: String
     let imageURL: URL
+    let imagePTSValue: Int64?
+    let imagePTSTimescale: Int32?
     let cameraPositionText: String
     let cameraForwardText: String
     let cameraPose: CaptureCameraPose
@@ -735,11 +832,19 @@ struct CaptureCameraPose {
 private struct CaptureFrameMetadata {
     let frameName: String
     let imagePath: String
+    let rgbPTSValue: Int64?
+    let rgbPTSTimescale: Int32?
     let imageWidth: Int
     let imageHeight: Int
     let intrinsics: [Float]
     let cameraToWorld: [Float]
-    let depthPath: String
+    let depthPath: String?
+    let depthVideoPath: String?
+    let depthVideoPTSValue: Int64?
+    let depthVideoPTSTimescale: Int32?
+    let depthVideoMinDepth: Float?
+    let depthVideoMaxDepth: Float?
+    let depthVideoInvalidValue: UInt16?
     let depthWidth: Int
     let depthHeight: Int
 }
@@ -783,6 +888,150 @@ private struct RGBAColor {
     let b: UInt8
 }
 
+private final class DepthVideoFrameReader {
+    private let asset: AVURLAsset
+    private var reader: AVAssetReader?
+    private var output: AVAssetReaderTrackOutput?
+    private var lastRequestedTime: CMTime?
+
+    init(url: URL) throws {
+        asset = AVURLAsset(url: url)
+        try resetReader()
+    }
+
+    func depthValues(
+        at time: CMTime,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        minDepth: Float,
+        maxDepth: Float,
+        invalidValue: UInt16
+    ) throws -> [Float] {
+        if let lastRequestedTime, time < lastRequestedTime {
+            try resetReader()
+        }
+        lastRequestedTime = time
+
+        guard let output else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        let tolerance = CMTime(value: 1, timescale: max(time.timescale, 600))
+        while let sampleBuffer = output.copyNextSampleBuffer() {
+            let sampleTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            guard sampleTime + tolerance >= time else { continue }
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+            }
+            return try decodeDepthValues(
+                from: pixelBuffer,
+                expectedWidth: expectedWidth,
+                expectedHeight: expectedHeight,
+                minDepth: minDepth,
+                maxDepth: maxDepth,
+                invalidValue: invalidValue
+            )
+        }
+
+        throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+    }
+
+    private func resetReader() throws {
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        self.reader = reader
+        self.output = output
+    }
+
+    private func decodeDepthValues(
+        from pixelBuffer: CVPixelBuffer,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        minDepth: Float,
+        maxDepth: Float,
+        invalidValue: UInt16
+    ) throws -> [Float] {
+        guard CVPixelBufferGetWidth(pixelBuffer) == expectedWidth,
+              CVPixelBufferGetHeight(pixelBuffer) == expectedHeight else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let yBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        let yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let depthRange = maxDepth - minDepth
+        var values = [Float](repeating: 0, count: expectedWidth * expectedHeight)
+
+        switch pixelFormat {
+        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            for row in 0..<expectedHeight {
+                let yRow = yBaseAddress.advanced(by: row * yBytesPerRow).assumingMemoryBound(to: UInt16.self)
+                for column in 0..<expectedWidth {
+                    let quantized = UInt16(littleEndian: yRow[column]) >> 6
+                    values[row * expectedWidth + column] = depthValue(
+                        quantized: quantized,
+                        maxQuantized: 1023,
+                        minDepth: minDepth,
+                        depthRange: depthRange,
+                        invalidValue: invalidValue
+                    )
+                }
+            }
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            for row in 0..<expectedHeight {
+                let yRow = yBaseAddress.advanced(by: row * yBytesPerRow).assumingMemoryBound(to: UInt8.self)
+                for column in 0..<expectedWidth {
+                    let quantized = UInt16(yRow[column]) * 1023 / 255
+                    values[row * expectedWidth + column] = depthValue(
+                        quantized: quantized,
+                        maxQuantized: 1023,
+                        minDepth: minDepth,
+                        depthRange: depthRange,
+                        invalidValue: invalidValue
+                    )
+                }
+            }
+        default:
+            throw CapturePreviewError.invalidDepth(asset.url.lastPathComponent)
+        }
+
+        return values
+    }
+
+    private func depthValue(
+        quantized: UInt16,
+        maxQuantized: UInt16,
+        minDepth: Float,
+        depthRange: Float,
+        invalidValue: UInt16
+    ) -> Float {
+        guard quantized != invalidValue else { return 0 }
+        return minDepth + (Float(quantized) / Float(maxQuantized)) * depthRange
+    }
+}
+
 private struct RGBAImage {
     let width: Int
     let height: Int
@@ -807,6 +1056,38 @@ private struct RGBAImage {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             throw CapturePreviewError.invalidImage(url.lastPathComponent)
+        }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        pixels = data
+    }
+
+    init(videoURL: URL, time: CMTime) throws {
+        let asset = AVURLAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+
+        let cgImage: CGImage
+        do {
+            cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+        } catch {
+            throw CapturePreviewError.invalidImage(videoURL.lastPathComponent)
+        }
+
+        width = cgImage.width
+        height = cgImage.height
+        var data = [UInt8](repeating: 0, count: width * height * 4)
+        guard let context = CGContext(
+            data: &data,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw CapturePreviewError.invalidImage(videoURL.lastPathComponent)
         }
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         pixels = data
