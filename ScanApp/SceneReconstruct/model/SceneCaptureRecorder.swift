@@ -20,7 +20,9 @@ final class SceneCaptureRecorder {
     private let rgbVideoTimescale: CMTimeScale = 600
 
     private var sessionDirectory: URL?
+    private var metadataDirectory: URL?
     private var depthDirectory: URL?
+    private var metadataWriter: JsonlSegmentWriter?
     private var rgbVideoWriter: RGBVideoWriter?
     private var depthPackedVideoWriter: DepthPackedVideoWriter?
     private var isRecording = false
@@ -46,25 +48,30 @@ final class SceneCaptureRecorder {
 
     func start(sessionDirectory: URL) throws {
         writerQueue.sync {
+            closeMetadataWriter()
             finishRGBVideoWriter()
             finishDepthPackedVideoWriter()
         }
 
         self.sessionDirectory = sessionDirectory
+        metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
         depthDirectory = sessionDirectory.appendingPathComponent("depth", isDirectory: true)
 
+        try FileManager.default.createDirectory(at: metadataDirectory!, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: depthDirectory!, withIntermediateDirectories: true)
+        metadataWriter = try JsonlSegmentWriter(directory: metadataDirectory!)
 
         isRecording = true
         recordingGeneration += 1
         firstFrameTimestamp = nil
-        lastDecision = "Recorder started + RGB video + Metal depth video"
+        lastDecision = "Recorder started + RGB video + Metal depth video + JSONL"
     }
 
     func stop() {
         isRecording = false
         lastDecision = "Recorder stopped"
         writerQueue.async { [weak self] in
+            self?.closeMetadataWriter()
             self?.finishRGBVideoWriter()
             self?.finishDepthPackedVideoWriter()
         }
@@ -73,6 +80,7 @@ final class SceneCaptureRecorder {
     func reset() {
         isRecording = false
         sessionDirectory = nil
+        metadataDirectory = nil
         depthDirectory = nil
         frameIndex = 0
         savedImageCount = 0
@@ -84,6 +92,7 @@ final class SceneCaptureRecorder {
         previousFrameTransform = nil
         lastDecision = "Recorder reset"
         writerQueue.async { [weak self] in
+            self?.closeMetadataWriter()
             self?.finishRGBVideoWriter()
             self?.finishDepthPackedVideoWriter()
         }
@@ -93,7 +102,7 @@ final class SceneCaptureRecorder {
         frameIndex += 1
 
         guard isRecording else { return }
-        guard let sessionDirectory else {
+        guard let sessionDirectory, metadataWriter != nil else {
             lastDecision = "Missing dataset directory"
             return
         }
@@ -201,7 +210,8 @@ final class SceneCaptureRecorder {
     private func writeFrameAssets(_ snapshot: SceneCaptureFrameSnapshot) throws {
         let rgbWriter = try rgbVideoWriter(for: snapshot)
         try rgbWriter.append(snapshot.pixelBuffer, presentationTime: snapshot.rgbPresentationTime)
-        _ = try writeDepthPackedVideoIfNeeded(snapshot)
+        let depthVideoFrameInfo = try writeDepthPackedVideoIfNeeded(snapshot)
+        try metadataWriter?.append(makeMetadata(from: snapshot, depthVideoFrameInfo: depthVideoFrameInfo))
     }
 
     private func makeMetadata(
@@ -240,17 +250,6 @@ final class SceneCaptureRecorder {
             "trackingState": snapshot.trackingStateText
         ]
 
-        if let depthSnapshot = snapshot.depthSnapshot,
-           let confidenceRelativePath = depthSnapshot.confidenceRelativePath {
-            metadata["confidence"] = [
-                "path": confidenceRelativePath,
-                "format": "uint8",
-                "timestamp": snapshot.timestamp,
-                "width": depthSnapshot.width,
-                "height": depthSnapshot.height
-            ]
-        }
-
         if let depthVideoFrameInfo {
             metadata["depth_video"] = [
                 "path": depthVideoFrameInfo.path,
@@ -276,16 +275,14 @@ final class SceneCaptureRecorder {
 
         let depthMap = depthData.depthMap
         let depthName = "\(frameName)_depth_f32.bin"
-        let confidenceName = "\(frameName)_confidence_u8.bin"
-        let confidenceMap = depthData.confidenceMap
 
         return SceneDepthFrameSnapshot(
             depthMap: depthMap,
-            confidenceMap: confidenceMap,
+            confidenceMap: nil,
             depthURL: depthDirectory.appendingPathComponent(depthName),
             depthRelativePath: "depth/\(depthName)",
-            confidenceURL: confidenceMap == nil ? nil : depthDirectory.appendingPathComponent(confidenceName),
-            confidenceRelativePath: confidenceMap == nil ? nil : "depth/\(confidenceName)",
+            confidenceURL: nil,
+            confidenceRelativePath: nil,
             width: CVPixelBufferGetWidth(depthMap),
             height: CVPixelBufferGetHeight(depthMap)
         )
@@ -329,13 +326,6 @@ final class SceneCaptureRecorder {
         return writer
     }
 
-    private func writeConfidenceDataIfNeeded(_ snapshot: SceneDepthFrameSnapshot?) throws {
-        guard let snapshot else { return }
-        if let confidenceMap = snapshot.confidenceMap, let confidenceURL = snapshot.confidenceURL {
-            try writeUInt8PixelBuffer(confidenceMap, to: confidenceURL)
-        }
-    }
-
     private func finishCaptureWrite(
         _ result: Result<Void, Error>,
         frameName: String,
@@ -358,6 +348,11 @@ final class SceneCaptureRecorder {
         case .failure(let error):
             lastDecision = "Save failed: \(error.localizedDescription)"
         }
+    }
+
+    private func closeMetadataWriter() {
+        try? metadataWriter?.close()
+        metadataWriter = nil
     }
 
     private func finishRGBVideoWriter() {
