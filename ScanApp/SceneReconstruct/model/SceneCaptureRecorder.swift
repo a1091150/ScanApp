@@ -133,7 +133,7 @@ final class SceneCaptureRecorder {
 
         let motion = estimateMotion(for: frame)
         let frameName = String(format: "frame_%06d", frameIndex)
-        let depthSnapshot = currentMode == .depthScan ? makeDepthSnapshot(from: frame, frameName: frameName) : nil
+        let depthSnapshot = makeDepthSnapshot(from: frame, frameName: frameName)
         let faceSnapshots = currentMode == .faceScan ? makeFaceSnapshots(from: frame) : []
         let pixelBuffer = frame.capturedImage
 

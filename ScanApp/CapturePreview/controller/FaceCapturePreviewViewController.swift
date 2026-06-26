@@ -10,6 +10,40 @@ import UIKit
 import simd
 
 final class FaceCapturePreviewViewController: UIViewController {
+    private enum PreviewKind: Int, CaseIterable {
+        case rgb
+        case depth
+
+        var title: String {
+            switch self {
+            case .rgb:
+                return "RGB"
+            case .depth:
+                return "Depth"
+            }
+        }
+
+        var relativePath: String {
+            switch self {
+            case .rgb:
+                return "rgb.mov"
+            case .depth:
+                return "depth/depth_packed_hevc.mov"
+            }
+        }
+    }
+
+    private struct VideoSummary {
+        let kind: PreviewKind
+        let url: URL
+        let duration: CMTime
+        let naturalSize: CGSize
+        let rawSize: CGSize
+        let preferredTransform: CGAffineTransform
+        let frameRate: Float
+        let fileSize: Int?
+    }
+
     private struct FaceFrame {
         let sessionTime: Double
         let ptsSeconds: Double
@@ -247,6 +281,7 @@ final class FaceCapturePreviewViewController: UIViewController {
     }
 
     private let session: CapturedScanSession
+    private let previewControl = UISegmentedControl(items: PreviewKind.allCases.map(\.title))
     private let playerView = PlayerView()
     private let overlayView = FaceOverlayView()
     private let statusLabel = UILabel()
@@ -255,6 +290,8 @@ final class FaceCapturePreviewViewController: UIViewController {
     private let slider = UISlider()
     private let timeLabel = UILabel()
 
+    private var summaries: [PreviewKind: VideoSummary] = [:]
+    private var selectedKind: PreviewKind = .rgb
     private var player: AVPlayer?
     private var timeObserver: Any?
     private var duration: CMTime = .zero
@@ -295,6 +332,10 @@ final class FaceCapturePreviewViewController: UIViewController {
     }
 
     private func configureUI() {
+        previewControl.translatesAutoresizingMaskIntoConstraints = false
+        previewControl.selectedSegmentIndex = selectedKind.rawValue
+        previewControl.addTarget(self, action: #selector(selectPreviewKind), for: .valueChanged)
+
         playerView.translatesAutoresizingMaskIntoConstraints = false
         playerView.backgroundColor = .black
         playerView.layer.cornerRadius = 8
@@ -338,6 +379,7 @@ final class FaceCapturePreviewViewController: UIViewController {
         metadataLabel.numberOfLines = 0
         metadataLabel.textColor = .label
 
+        view.addSubview(previewControl)
         view.addSubview(playerView)
         playerView.addSubview(overlayView)
         playerView.addSubview(statusLabel)
@@ -347,10 +389,14 @@ final class FaceCapturePreviewViewController: UIViewController {
         view.addSubview(metadataLabel)
 
         NSLayoutConstraint.activate([
-            playerView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            playerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            playerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            playerView.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor, multiplier: 0.58),
+            previewControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            previewControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            previewControl.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+
+            playerView.leadingAnchor.constraint(equalTo: previewControl.leadingAnchor),
+            playerView.trailingAnchor.constraint(equalTo: previewControl.trailingAnchor),
+            playerView.topAnchor.constraint(equalTo: previewControl.bottomAnchor, constant: 12),
+            playerView.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor, multiplier: 0.55),
 
             overlayView.leadingAnchor.constraint(equalTo: playerView.leadingAnchor),
             overlayView.trailingAnchor.constraint(equalTo: playerView.trailingAnchor),
@@ -393,29 +439,82 @@ final class FaceCapturePreviewViewController: UIViewController {
     }
 
     private func loadPreview() {
-        let videoURL = session.url.appendingPathComponent("rgb.mov")
-        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+        summaries = Dictionary(
+            uniqueKeysWithValues: PreviewKind.allCases.compactMap { kind in
+                guard let summary = makeVideoSummary(kind: kind) else { return nil }
+                return (kind, summary)
+            }
+        )
+
+        for kind in PreviewKind.allCases {
+            previewControl.setEnabled(summaries[kind] != nil, forSegmentAt: kind.rawValue)
+        }
+
+        if summaries[selectedKind] == nil {
+            selectedKind = summaries[.rgb] != nil ? .rgb : .depth
+            previewControl.selectedSegmentIndex = selectedKind.rawValue
+        }
+
+        faceFrames = loadFaceFrames()
+        overlayView.faceFrames = faceFrames
+
+        guard summaries[selectedKind] != nil else {
+            playerView.playerLayer.player = nil
             playButton.isEnabled = false
             slider.isEnabled = false
-            statusLabel.text = "No RGB"
-            metadataLabel.text = "No rgb.mov found.\nSession: \(session.id)"
+            statusLabel.text = "No video"
+            metadataLabel.text = [
+                "No previewable video found.",
+                "Expected: rgb.mov",
+                "Expected: depth/depth_packed_hevc.mov",
+                "Session: \(session.id)"
+            ].joined(separator: "\n")
             return
         }
 
-        let asset = AVURLAsset(url: videoURL)
+        playButton.isEnabled = true
+        slider.isEnabled = true
+        loadSelectedVideo(autoplay: false)
+    }
+
+    private func makeVideoSummary(kind: PreviewKind) -> VideoSummary? {
+        let url = session.url.appendingPathComponent(kind.relativePath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+
+        let asset = AVURLAsset(url: url)
         let track = asset.tracks(withMediaType: .video).first
         let rawSize = track?.naturalSize ?? .zero
         let preferredTransform = track?.preferredTransform ?? .identity
         let transformedSize = rawSize.applying(preferredTransform)
-        naturalSize = CGSize(width: abs(transformedSize.width), height: abs(transformedSize.height))
-        duration = asset.duration
-        faceFrames = loadFaceFrames()
-        overlayView.faceFrames = faceFrames
-        overlayView.videoNaturalSize = naturalSize
-        overlayView.rawVideoSize = rawSize
-        overlayView.preferredTransform = preferredTransform
+        let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
 
-        let item = AVPlayerItem(url: videoURL)
+        return VideoSummary(
+            kind: kind,
+            url: url,
+            duration: asset.duration,
+            naturalSize: CGSize(width: abs(transformedSize.width), height: abs(transformedSize.height)),
+            rawSize: rawSize,
+            preferredTransform: preferredTransform,
+            frameRate: track?.nominalFrameRate ?? 0,
+            fileSize: fileSize
+        )
+    }
+
+    private func loadSelectedVideo(autoplay: Bool) {
+        guard let summary = summaries[selectedKind] else { return }
+
+        removeTimeObserver()
+        NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: nil)
+
+        naturalSize = summary.naturalSize
+        duration = summary.duration
+        overlayView.isHidden = summary.kind != .rgb
+        overlayView.videoNaturalSize = summary.naturalSize
+        overlayView.rawVideoSize = summary.rawSize
+        overlayView.preferredTransform = summary.preferredTransform
+        overlayView.currentTime = 0
+
+        let item = AVPlayerItem(url: summary.url)
         let player = AVPlayer(playerItem: item)
         self.player = player
         playerView.playerLayer.player = player
@@ -431,9 +530,16 @@ final class FaceCapturePreviewViewController: UIViewController {
             object: item
         )
         addTimeObserver()
-        updateMetadata(videoURL: videoURL, track: track)
-        updateTimeLabel(current: .zero, duration: duration)
-        statusLabel.text = "Faces: \(faceFrames.count)"
+        slider.value = 0
+        updateMetadata(for: summary)
+        updateTimeLabel(current: .zero, duration: summary.duration)
+        statusLabel.text = summary.kind == .rgb ? "Faces: \(faceFrames.count)" : "Depth"
+        updatePlayButton(isPlaying: false)
+
+        if autoplay {
+            player.play()
+            updatePlayButton(isPlaying: true)
+        }
     }
 
     private func loadFaceFrames() -> [FaceFrame] {
@@ -509,28 +615,40 @@ final class FaceCapturePreviewViewController: UIViewController {
         )
     }
 
-    private func updateMetadata(videoURL: URL, track: AVAssetTrack?) {
-        let fileSize = (try? videoURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+    private func updateMetadata(for summary: VideoSummary) {
         let faceSamples = faceFrames.reduce(0) { $0 + $1.faces.count }
         let eyeSamples = faceFrames.reduce(0) { total, frame in
             total + frame.faces.reduce(0) { faceTotal, face in
                 faceTotal + (face.leftEyeTransform == nil ? 0 : 1) + (face.rightEyeTransform == nil ? 0 : 1)
             }
         }
-        metadataLabel.text = [
-            "Preview: Face RGB + projected face/eye anchors",
-            "File: rgb.mov",
-            "Duration: \(format(seconds: duration.seconds))",
-            String(format: "Size: %.0f x %.0f", naturalSize.width, naturalSize.height),
-            "Transform: \(trackTransformText(track?.preferredTransform ?? .identity))",
-            "Projection: \(faceFrames.first?.projectionOrientationName ?? "unknown")",
-            String(format: "FPS: %.2f", track?.nominalFrameRate ?? 0),
-            "Metadata frames: \(faceFrames.count)",
-            "Face samples: \(faceSamples)",
-            "Eye samples: \(eyeSamples)",
-            "Bytes: \(fileSize.map(String.init) ?? "unknown")",
+
+        var lines = [
+            "Preview: \(summary.kind == .rgb ? "Face RGB + projected face/eye anchors" : "Face Depth")",
+            "File: \(summary.kind.relativePath)",
+            "Duration: \(format(seconds: summary.duration.seconds))",
+            String(format: "Size: %.0f x %.0f", summary.naturalSize.width, summary.naturalSize.height),
+            "Transform: \(trackTransformText(summary.preferredTransform))",
+            String(format: "FPS: %.2f", summary.frameRate),
+            "Bytes: \(summary.fileSize.map(String.init) ?? "unknown")",
             "Session: \(session.id)"
-        ].joined(separator: "\n")
+        ]
+
+        if summary.kind == .rgb {
+            lines.insert(contentsOf: [
+                "Projection: \(faceFrames.first?.projectionOrientationName ?? "unknown")",
+                "Metadata frames: \(faceFrames.count)",
+                "Face samples: \(faceSamples)",
+                "Eye samples: \(eyeSamples)"
+            ], at: 6)
+        } else {
+            lines.insert(contentsOf: [
+            "Metadata frames: \(faceFrames.count)",
+                "Depth source: captured_depth_data"
+            ], at: 6)
+        }
+
+        metadataLabel.text = lines.joined(separator: "\n")
     }
 
     private func addTimeObserver() {
@@ -558,6 +676,13 @@ final class FaceCapturePreviewViewController: UIViewController {
         }
         overlayView.currentTime = current.seconds
         updateTimeLabel(current: current, duration: duration)
+    }
+
+    @objc private func selectPreviewKind() {
+        guard let kind = PreviewKind(rawValue: previewControl.selectedSegmentIndex) else { return }
+        let wasPlaying = player?.timeControlStatus == .playing
+        selectedKind = kind
+        loadSelectedVideo(autoplay: wasPlaying)
     }
 
     @objc private func togglePlayback() {
