@@ -15,6 +15,9 @@ final class FaceCapturePreviewViewController: UIViewController {
         let ptsSeconds: Double
         let width: CGFloat
         let height: CGFloat
+        let projectionViewportWidth: CGFloat
+        let projectionViewportHeight: CGFloat
+        let projectionOrientationName: String
         let worldToCamera: simd_float4x4
         let projectionMatrix: simd_float4x4
         let faces: [FaceAnchor]
@@ -42,6 +45,11 @@ final class FaceCapturePreviewViewController: UIViewController {
     private final class FaceOverlayView: UIView {
         var faceFrames: [FaceFrame] = []
         var videoNaturalSize: CGSize = .zero
+        var displayedVideoRect: CGRect = .zero {
+            didSet { setNeedsDisplay() }
+        }
+        var rawVideoSize: CGSize = .zero
+        var preferredTransform: CGAffineTransform = .identity
         var currentTime: Double = 0 {
             didSet { setNeedsDisplay() }
         }
@@ -59,7 +67,9 @@ final class FaceCapturePreviewViewController: UIViewController {
 
         override func draw(_ rect: CGRect) {
             guard let frame = nearestFrame(to: currentTime) else { return }
-            let videoRect = aspectFitRect(contentSize: videoNaturalSize, in: bounds)
+            let videoRect = displayedVideoRect.width > 0 && displayedVideoRect.height > 0
+                ? displayedVideoRect
+                : bounds
             guard videoRect.width > 0, videoRect.height > 0 else { return }
 
             let context = UIGraphicsGetCurrentContext()
@@ -130,10 +140,52 @@ final class FaceCapturePreviewViewController: UIViewController {
             let ndcY = clip.y / clip.w
             guard ndcX.isFinite, ndcY.isFinite else { return nil }
 
-            let x = videoRect.minX + CGFloat((ndcX + 1) * 0.5) * videoRect.width
-            let y = videoRect.minY + CGFloat((1 - ndcY) * 0.5) * videoRect.height
-            guard videoRect.insetBy(dx: -40, dy: -40).contains(CGPoint(x: x, y: y)) else { return nil }
-            return CGPoint(x: x, y: y)
+            let normalizedPoint = CGPoint(
+                x: CGFloat((ndcX + 1) * 0.5),
+                y: CGFloat((1 - ndcY) * 0.5)
+            )
+            let displayPoint = displayNormalizedPoint(normalizedPoint, frame: frame)
+            let x = videoRect.minX + displayPoint.x * videoRect.width
+            let y = videoRect.minY + displayPoint.y * videoRect.height
+            let point = CGPoint(x: x, y: y)
+            guard videoRect.insetBy(dx: -40, dy: -40).contains(point) else { return nil }
+            return point
+        }
+
+        private func displayNormalizedPoint(_ point: CGPoint, frame: FaceFrame) -> CGPoint {
+            switch frame.projectionOrientationName {
+            case "portrait":
+                return CGPoint(x: 1 - point.y, y: point.x)
+            case "portraitUpsideDown":
+                return CGPoint(x: point.y, y: 1 - point.x)
+            default:
+                break
+            }
+
+            let rawSize = rawVideoSize == .zero
+                ? CGSize(width: frame.width, height: frame.height)
+                : rawVideoSize
+            guard rawSize.width > 0, rawSize.height > 0 else { return point }
+
+            let rawPoint = CGPoint(x: point.x * rawSize.width, y: point.y * rawSize.height)
+            return transformedVideoPoint(rawPoint, rawSize: rawSize)
+        }
+
+        private func transformedVideoPoint(_ point: CGPoint, rawSize: CGSize) -> CGPoint {
+            guard preferredTransform != .identity else {
+                return CGPoint(x: point.x / rawSize.width, y: point.y / rawSize.height)
+            }
+
+            let transformedBounds = CGRect(origin: .zero, size: rawSize).applying(preferredTransform)
+            guard transformedBounds.width != 0, transformedBounds.height != 0 else {
+                return CGPoint(x: point.x / rawSize.width, y: point.y / rawSize.height)
+            }
+
+            let transformedPoint = point.applying(preferredTransform)
+            return CGPoint(
+                x: (transformedPoint.x - transformedBounds.minX) / abs(transformedBounds.width),
+                y: (transformedPoint.y - transformedBounds.minY) / abs(transformedBounds.height)
+            )
         }
 
         private func drawEyes(for face: FaceAnchor, frame: FaceFrame, videoRect: CGRect) {
@@ -182,22 +234,6 @@ final class FaceCapturePreviewViewController: UIViewController {
             circle.fill()
             circle.stroke()
             drawLabel(label, at: CGPoint(x: point.x + 7, y: point.y - 8))
-        }
-
-        private func aspectFitRect(contentSize: CGSize, in bounds: CGRect) -> CGRect {
-            guard contentSize.width > 0, contentSize.height > 0, bounds.width > 0, bounds.height > 0 else {
-                return bounds
-            }
-
-            let scale = min(bounds.width / contentSize.width, bounds.height / contentSize.height)
-            let width = contentSize.width * scale
-            let height = contentSize.height * scale
-            return CGRect(
-                x: bounds.midX - width * 0.5,
-                y: bounds.midY - height * 0.5,
-                width: width,
-                height: height
-            )
         }
 
         private func drawLabel(_ text: String, at point: CGPoint) {
@@ -253,8 +289,9 @@ final class FaceCapturePreviewViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        playerView.playerLayer.videoGravity = .resizeAspect
+        playerView.playerLayer.videoGravity = .resize
         overlayView.videoNaturalSize = naturalSize
+        overlayView.displayedVideoRect = overlayView.bounds
     }
 
     private func configureUI() {
@@ -262,7 +299,7 @@ final class FaceCapturePreviewViewController: UIViewController {
         playerView.backgroundColor = .black
         playerView.layer.cornerRadius = 8
         playerView.layer.masksToBounds = true
-        playerView.playerLayer.videoGravity = .resizeAspect
+        playerView.playerLayer.videoGravity = .resize
 
         overlayView.translatesAutoresizingMaskIntoConstraints = false
 
@@ -367,17 +404,26 @@ final class FaceCapturePreviewViewController: UIViewController {
 
         let asset = AVURLAsset(url: videoURL)
         let track = asset.tracks(withMediaType: .video).first
-        let transformedSize = track?.naturalSize.applying(track?.preferredTransform ?? .identity) ?? .zero
+        let rawSize = track?.naturalSize ?? .zero
+        let preferredTransform = track?.preferredTransform ?? .identity
+        let transformedSize = rawSize.applying(preferredTransform)
         naturalSize = CGSize(width: abs(transformedSize.width), height: abs(transformedSize.height))
         duration = asset.duration
         faceFrames = loadFaceFrames()
         overlayView.faceFrames = faceFrames
         overlayView.videoNaturalSize = naturalSize
+        overlayView.rawVideoSize = rawSize
+        overlayView.preferredTransform = preferredTransform
 
         let item = AVPlayerItem(url: videoURL)
         let player = AVPlayer(playerItem: item)
         self.player = player
         playerView.playerLayer.player = player
+        view.setNeedsLayout()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.overlayView.displayedVideoRect = self.overlayView.bounds
+        }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(playerItemDidFinish(_:)),
@@ -427,12 +473,18 @@ final class FaceCapturePreviewViewController: UIViewController {
             return nil
         }
 
+        let projectionViewportWidth = doubleValue(object["projection_viewport_width"]) ?? width
+        let projectionViewportHeight = doubleValue(object["projection_viewport_height"]) ?? height
+        let projectionOrientationName = object["projection_orientation"] as? String ?? "unknown"
         let faces = (object["faces"] as? [[String: Any]] ?? []).compactMap(makeFaceAnchor(from:))
         return FaceFrame(
             sessionTime: sessionTime,
             ptsSeconds: ptsSeconds,
             width: CGFloat(width),
             height: CGFloat(height),
+            projectionViewportWidth: CGFloat(projectionViewportWidth),
+            projectionViewportHeight: CGFloat(projectionViewportHeight),
+            projectionOrientationName: projectionOrientationName,
             worldToCamera: worldToCamera,
             projectionMatrix: projectionMatrix,
             faces: faces
@@ -470,6 +522,8 @@ final class FaceCapturePreviewViewController: UIViewController {
             "File: rgb.mov",
             "Duration: \(format(seconds: duration.seconds))",
             String(format: "Size: %.0f x %.0f", naturalSize.width, naturalSize.height),
+            "Transform: \(trackTransformText(track?.preferredTransform ?? .identity))",
+            "Projection: \(faceFrames.first?.projectionOrientationName ?? "unknown")",
             String(format: "FPS: %.2f", track?.nominalFrameRate ?? 0),
             "Metadata frames: \(faceFrames.count)",
             "Face samples: \(faceSamples)",
@@ -568,6 +622,18 @@ final class FaceCapturePreviewViewController: UIViewController {
     private func format(seconds: Double) -> String {
         guard seconds.isFinite else { return "0.00" }
         return String(format: "%.2f", max(0, seconds))
+    }
+
+    private func trackTransformText(_ transform: CGAffineTransform) -> String {
+        String(
+            format: "[%.0f %.0f %.0f %.0f %.0f %.0f]",
+            transform.a,
+            transform.b,
+            transform.c,
+            transform.d,
+            transform.tx,
+            transform.ty
+        )
     }
 
     private func doubleValue(_ value: Any?) -> Double? {

@@ -33,6 +33,7 @@ final class SceneCaptureRecorder {
     private var pendingWriteCount = 0
     private var recordingGeneration = 0
     private var firstFrameTimestamp: TimeInterval?
+    private var recordingProjectionOrientation: UIInterfaceOrientation?
     private var previousFrameTimestamp: TimeInterval?
     private var previousFrameTransform: simd_float4x4?
     private var lastDecision = "Recorder idle"
@@ -57,9 +58,7 @@ final class SceneCaptureRecorder {
         captureMode = mode
         self.sessionDirectory = sessionDirectory
         metadataDirectory = sessionDirectory.appendingPathComponent("metadata", isDirectory: true)
-        depthDirectory = mode == .depthScan
-            ? sessionDirectory.appendingPathComponent("depth", isDirectory: true)
-            : nil
+        depthDirectory = sessionDirectory.appendingPathComponent("depth", isDirectory: true)
 
         try FileManager.default.createDirectory(at: metadataDirectory!, withIntermediateDirectories: true)
         if let depthDirectory {
@@ -70,6 +69,7 @@ final class SceneCaptureRecorder {
         isRecording = true
         recordingGeneration += 1
         firstFrameTimestamp = nil
+        recordingProjectionOrientation = nil
         lastDecision = mode == .depthScan
             ? "Recorder started + RGB video + Metal depth video + JSONL"
             : "Recorder started + face RGB video + JSONL"
@@ -96,6 +96,7 @@ final class SceneCaptureRecorder {
         pendingWriteCount = 0
         recordingGeneration += 1
         firstFrameTimestamp = nil
+        recordingProjectionOrientation = nil
         previousFrameTimestamp = nil
         previousFrameTransform = nil
         captureMode = .depthScan
@@ -108,12 +109,16 @@ final class SceneCaptureRecorder {
     }
 
     func process(frame: ARFrame, interfaceOrientation: UIInterfaceOrientation) {
+        guard isRecording else { return }
         frameIndex += 1
 
-        guard isRecording else { return }
         let currentMode = captureMode
-        let projectionOrientation = normalizedProjectionOrientation(
+        let liveProjectionOrientation = normalizedProjectionOrientation(
             interfaceOrientation: interfaceOrientation,
+            mode: currentMode
+        )
+        let projectionOrientation = lockedProjectionOrientation(
+            liveProjectionOrientation,
             mode: currentMode
         )
 
@@ -147,9 +152,14 @@ final class SceneCaptureRecorder {
         firstFrameTimestamp = firstTimestamp
         let sessionTime = frame.timestamp - firstTimestamp
         let rgbPresentationTime = CMTime(seconds: sessionTime, preferredTimescale: rgbVideoTimescale)
+        let projectionViewportSize = projectionViewportSize(
+            for: projectionOrientation,
+            pixelWidth: width,
+            pixelHeight: height
+        )
         let projection = camera.projectionMatrix(
             for: projectionOrientation,
-            viewportSize: CGSize(width: CGFloat(width), height: CGFloat(height)),
+            viewportSize: projectionViewportSize,
             zNear: 0.001,
             zFar: 100
         )
@@ -164,10 +174,13 @@ final class SceneCaptureRecorder {
             rgbURL: sessionDirectory.appendingPathComponent(rgbVideoRelativePath),
             rgbRelativePath: rgbVideoRelativePath,
             rgbPresentationTime: rgbPresentationTime,
+            rgbTrackTransform: videoTrackTransform(for: projectionOrientation),
             depthVideoURL: sessionDirectory.appendingPathComponent(depthPackedVideoRelativePath),
             depthVideoRelativePath: depthPackedVideoRelativePath,
             width: width,
             height: height,
+            projectionViewportWidth: projectionViewportSize.width,
+            projectionViewportHeight: projectionViewportSize.height,
             imageOrientationName: projectionOrientation.metadataName,
             projectionOrientationName: projectionOrientation.metadataName,
             requiredOrientationName: currentMode.requiredOrientationName,
@@ -238,9 +251,7 @@ final class SceneCaptureRecorder {
     private func writeFrameAssets(_ snapshot: SceneCaptureFrameSnapshot) throws {
         let rgbWriter = try rgbVideoWriter(for: snapshot)
         try rgbWriter.append(snapshot.pixelBuffer, presentationTime: snapshot.rgbPresentationTime)
-        let depthVideoFrameInfo = snapshot.captureMode == .depthScan
-            ? try writeDepthPackedVideoIfNeeded(snapshot)
-            : nil
+        let depthVideoFrameInfo = try writeDepthPackedVideoIfNeeded(snapshot)
         try metadataWriter?.append(makeMetadata(from: snapshot, depthVideoFrameInfo: depthVideoFrameInfo))
     }
 
@@ -268,6 +279,8 @@ final class SceneCaptureRecorder {
             "ui_orientation": snapshot.interfaceOrientationName,
             "width": snapshot.width,
             "height": snapshot.height,
+            "projection_viewport_width": snapshot.projectionViewportWidth,
+            "projection_viewport_height": snapshot.projectionViewportHeight,
             "intrinsics": flatten3x3(snapshot.intrinsics),
             "camera_to_world": flatten4x4(snapshot.cameraTransform),
             "world_to_camera": flatten4x4(snapshot.worldToCamera),
@@ -306,6 +319,7 @@ final class SceneCaptureRecorder {
                 "invalid_value": depthVideoFrameInfo.invalidValue,
                 "width": depthVideoFrameInfo.width,
                 "height": depthVideoFrameInfo.height,
+                "source": snapshot.captureMode == .faceScan ? "captured_depth_data" : "scene_depth",
                 "pts_seconds": depthVideoFrameInfo.ptsSeconds,
                 "pts_value": depthVideoFrameInfo.ptsValue,
                 "pts_timescale": depthVideoFrameInfo.ptsTimescale
@@ -317,14 +331,27 @@ final class SceneCaptureRecorder {
 
     private func makeDepthSnapshot(from frame: ARFrame, frameName: String) -> SceneDepthFrameSnapshot? {
         guard let depthDirectory else { return nil }
-        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        let depthMap: CVPixelBuffer
+        let confidenceMap: CVPixelBuffer?
 
-        let depthMap = depthData.depthMap
+        switch captureMode {
+        case .depthScan:
+            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+            depthMap = depthData.depthMap
+            confidenceMap = depthData.confidenceMap
+        case .faceScan:
+            guard let depthData = frame.capturedDepthData?.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32) else {
+                return nil
+            }
+            depthMap = depthData.depthDataMap
+            confidenceMap = nil
+        }
+
         let depthName = "\(frameName)_depth_f32.bin"
 
         return SceneDepthFrameSnapshot(
             depthMap: depthMap,
-            confidenceMap: nil,
+            confidenceMap: confidenceMap,
             depthURL: depthDirectory.appendingPathComponent(depthName),
             depthRelativePath: "depth/\(depthName)",
             confidenceURL: nil,
@@ -338,12 +365,21 @@ final class SceneCaptureRecorder {
         interfaceOrientation: UIInterfaceOrientation,
         mode: SceneCaptureMode
     ) -> UIInterfaceOrientation {
-        switch mode {
-        case .depthScan:
-            return .landscapeRight
-        case .faceScan:
-            return interfaceOrientation == .unknown ? mode.preferredInterfaceOrientation : interfaceOrientation
+        mode.preferredInterfaceOrientation
+    }
+
+    private func lockedProjectionOrientation(
+        _ orientation: UIInterfaceOrientation,
+        mode: SceneCaptureMode
+    ) -> UIInterfaceOrientation {
+        guard mode == .faceScan else {
+            return orientation
         }
+        if let recordingProjectionOrientation {
+            return recordingProjectionOrientation
+        }
+        recordingProjectionOrientation = orientation
+        return orientation
     }
 
     private func makeFaceSnapshots(from frame: ARFrame) -> [SceneFaceAnchorSnapshot] {
@@ -390,7 +426,8 @@ final class SceneCaptureRecorder {
         let writer = try RGBVideoWriter(
             url: snapshot.rgbURL,
             width: snapshot.width,
-            height: snapshot.height
+            height: snapshot.height,
+            transform: snapshot.rgbTrackTransform
         )
         rgbVideoWriter = writer
         return writer
@@ -461,6 +498,36 @@ final class SceneCaptureRecorder {
         writer?.finish {}
     }
 
+}
+
+private func videoTrackTransform(for orientation: UIInterfaceOrientation) -> CGAffineTransform {
+    switch orientation {
+    case .portrait:
+        return CGAffineTransform(rotationAngle: .pi / 2)
+    case .portraitUpsideDown:
+        return CGAffineTransform(rotationAngle: -.pi / 2)
+    case .landscapeLeft:
+        return CGAffineTransform(rotationAngle: .pi)
+    case .landscapeRight, .unknown:
+        return .identity
+    @unknown default:
+        return .identity
+    }
+}
+
+private func projectionViewportSize(
+    for orientation: UIInterfaceOrientation,
+    pixelWidth: Int,
+    pixelHeight: Int
+) -> CGSize {
+    switch orientation {
+    case .portrait, .portraitUpsideDown:
+        return CGSize(width: CGFloat(pixelHeight), height: CGFloat(pixelWidth))
+    case .landscapeLeft, .landscapeRight, .unknown:
+        return CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+    @unknown default:
+        return CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+    }
 }
 
 fileprivate func flatten3x3(_ matrix: simd_float3x3) -> [Float] {

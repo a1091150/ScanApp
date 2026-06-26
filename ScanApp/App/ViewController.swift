@@ -93,7 +93,7 @@ class ViewController: UIViewController {
         if let navigationController {
             navigationController.pushViewController(viewController, animated: true)
         } else {
-            let navigationController = UINavigationController(rootViewController: viewController)
+            let navigationController = OrientationForwardingNavigationController(rootViewController: viewController)
             navigationController.modalPresentationStyle = .fullScreen
             present(navigationController, animated: true)
         }

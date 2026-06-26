@@ -34,7 +34,7 @@ enum SceneCaptureMode: Int {
         case .depthScan:
             return "arkit_rgb_depth_video_jsonl_metal_v1"
         case .faceScan:
-            return "arkit_face_rgb_video_jsonl_v1"
+            return "arkit_face_rgb_depth_video_jsonl_v1"
         }
     }
 
@@ -43,7 +43,7 @@ enum SceneCaptureMode: Int {
         case .depthScan:
             return .landscapeRight
         case .faceScan:
-            return .portrait
+            return .landscapeRight
         }
     }
 
@@ -52,7 +52,7 @@ enum SceneCaptureMode: Int {
         case .depthScan:
             return .landscapeRight
         case .faceScan:
-            return .portrait
+            return .landscapeRight
         }
     }
 

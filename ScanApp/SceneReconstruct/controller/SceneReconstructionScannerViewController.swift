@@ -19,6 +19,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private let arView = ARView(frame: .zero)
     private let viewModel = SceneReconstructionScanViewModel()
     private let captureRecorder = SceneCaptureRecorder()
+    private let minimumPreviewWarmupDuration: TimeInterval = 0.35
 
     private let statusView = SceneReconstructionStatusView()
     private let modeControl = UISegmentedControl(items: [
@@ -34,6 +35,10 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private var supportStatus = "Not checked"
     private var depthStatus = "Depth: unavailable"
     private var confidenceStatus = "Confidence: unavailable"
+    private var isPreviewSessionRunning = false
+    private var previewSessionMode: SceneCaptureMode?
+    private var previewStartedAt: TimeInterval?
+    private var hasReceivedPreviewFrame = false
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         selectedCaptureMode.supportedInterfaceOrientations
@@ -44,7 +49,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     }
 
     override var shouldAutorotate: Bool {
-        true
+        false
     }
 
     override func viewDidLoad() {
@@ -59,9 +64,15 @@ final class SceneReconstructionScannerViewController: UIViewController {
         updateStats()
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        requestRequiredOrientation()
+        startPreviewSession(resetTracking: true)
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        pauseScanning()
+        stopPreviewSession()
     }
 
     private func configureARView() {
@@ -217,6 +228,8 @@ final class SceneReconstructionScannerViewController: UIViewController {
         evaluateDeviceSupport()
         setNeedsUpdateOfSupportedInterfaceOrientations()
         navigationController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        requestRequiredOrientation()
+        startPreviewSession(resetTracking: true)
         updateStats()
     }
 
@@ -230,19 +243,24 @@ final class SceneReconstructionScannerViewController: UIViewController {
         depthStatus = selectedCaptureMode == .depthScan ? "Depth: unavailable" : "Face: unavailable"
         confidenceStatus = selectedCaptureMode == .depthScan ? "Confidence: unavailable" : "Face metadata: unavailable"
         viewModel.resetScanDirectory()
-        runScanSession(resetTracking: true)
+        startRecording()
     }
 
     private func continueScanning() {
-        runScanSession(resetTracking: false)
+        startRecording()
     }
 
-    private func runScanSession(resetTracking: Bool) {
+    private func startPreviewSession(resetTracking: Bool) {
         let mode = selectedCaptureMode
         evaluateDeviceSupport()
         guard canStartScan else {
-            scanState = .idle
+            isPreviewSessionRunning = false
+            previewSessionMode = nil
             updateStats()
+            return
+        }
+
+        if isPreviewSessionRunning, previewSessionMode == mode, !resetTracking {
             return
         }
 
@@ -255,12 +273,52 @@ final class SceneReconstructionScannerViewController: UIViewController {
             configuration = makeFaceScanConfiguration()
         }
 
+        let options: ARSession.RunOptions = resetTracking ? [.resetTracking] : []
+        arView.session.run(configuration, options: options)
+        isPreviewSessionRunning = true
+        previewSessionMode = mode
+        previewStartedAt = Date.timeIntervalSinceReferenceDate
+        hasReceivedPreviewFrame = false
+        updateStats()
+    }
+
+    private func stopPreviewSession() {
+        stopImageRecording()
+        arView.session.pause()
+        isPreviewSessionRunning = false
+        previewSessionMode = nil
+        previewStartedAt = nil
+        hasReceivedPreviewFrame = false
+
+        if scanState == .recording {
+            scanState = .paused
+        }
+
+        updateStats()
+    }
+
+    private func startRecording() {
+        let mode = selectedCaptureMode
+        evaluateDeviceSupport()
+        guard canStartScan else {
+            scanState = .idle
+            updateStats()
+            return
+        }
+
+        if !isPreviewSessionRunning || previewSessionMode != mode {
+            startPreviewSession(resetTracking: true)
+        }
+
+        guard isPreviewReadyForRecording else {
+            updateStats()
+            return
+        }
+
         do {
             let directory = try viewModel.currentScanDirectory(mode: mode)
             try captureRecorder.start(sessionDirectory: directory, mode: mode)
             isRecordingImages = true
-            let options: ARSession.RunOptions = resetTracking ? [.resetTracking] : []
-            arView.session.run(configuration, options: options)
             scanState = .recording
             updateStats()
         } catch {
@@ -308,7 +366,6 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
     private func pauseScanning() {
         guard scanState == .recording else { return }
-        arView.session.pause()
         stopImageRecording()
         scanState = .paused
         updateStats()
@@ -323,7 +380,6 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
     @objc private func saveAndResetScan() {
         if scanState == .recording {
-            arView.session.pause()
             stopImageRecording()
         }
         captureRecorder.reset()
@@ -333,6 +389,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
         viewModel.resetScanDirectory()
         scanState = .idle
         evaluateDeviceSupport()
+        startPreviewSession(resetTracking: false)
         updateStats()
     }
 
@@ -352,8 +409,9 @@ final class SceneReconstructionScannerViewController: UIViewController {
     }
 
     private func updateButtonState() {
-        primaryButton.isEnabled = canStartScan
-        primaryButton.alpha = canStartScan ? 1 : 0.55
+        let canUsePrimaryButton = canStartScan && (scanState != .idle || isPreviewReadyForRecording)
+        primaryButton.isEnabled = canUsePrimaryButton
+        primaryButton.alpha = canUsePrimaryButton ? 1 : 0.55
         modeControl.isEnabled = scanState == .idle
 
         switch scanState {
@@ -387,7 +445,11 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private func updateFaceStatus(from frame: ARFrame) {
         let faceCount = frame.anchors.compactMap { $0 as? ARFaceAnchor }.count
         depthStatus = "Face: \(faceCount)"
-        confidenceStatus = "Face metadata: JSONL"
+        if let depthMap = frame.capturedDepthData?.depthDataMap {
+            confidenceStatus = "Face depth: \(CVPixelBufferGetWidth(depthMap)) x \(CVPixelBufferGetHeight(depthMap))"
+        } else {
+            confidenceStatus = "Face depth: unavailable"
+        }
     }
 
     private func trackingText(for trackingState: ARCamera.TrackingState?) -> String {
@@ -424,10 +486,27 @@ final class SceneReconstructionScannerViewController: UIViewController {
         present(alert, animated: true)
     }
 
+    private func requestRequiredOrientation() {
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+        navigationController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+
+        guard let windowScene = view.window?.windowScene else { return }
+        if #available(iOS 16.0, *) {
+            windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: selectedCaptureMode.supportedInterfaceOrientations))
+        } else {
+            UIDevice.current.setValue(selectedCaptureMode.preferredInterfaceOrientation.rawValue, forKey: "orientation")
+            UIViewController.attemptRotationToDeviceOrientation()
+        }
+    }
+
 }
 
 extension SceneReconstructionScannerViewController: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        if isPreviewSessionRunning, previewSessionMode == selectedCaptureMode {
+            hasReceivedPreviewFrame = true
+        }
+
         switch selectedCaptureMode {
         case .depthScan:
             updateDepthStatus(from: frame)
@@ -467,5 +546,16 @@ private extension SceneReconstructionScannerViewController {
 
     var currentInterfaceOrientation: UIInterfaceOrientation {
         view.window?.windowScene?.interfaceOrientation ?? selectedCaptureMode.preferredInterfaceOrientation
+    }
+
+    var isPreviewReadyForRecording: Bool {
+        guard isPreviewSessionRunning,
+              previewSessionMode == selectedCaptureMode,
+              hasReceivedPreviewFrame,
+              let previewStartedAt else {
+            return false
+        }
+
+        return Date.timeIntervalSinceReferenceDate - previewStartedAt >= minimumPreviewWarmupDuration
     }
 }

@@ -56,24 +56,18 @@ final class SceneReconstructionScanViewModel {
             "image_orientation": mode.requiredOrientationName,
             "projection_orientation": mode.requiredOrientationName,
             "required_orientation": mode.requiredOrientationName,
-            "records_depth_data": mode == .depthScan,
+            "records_depth_data": true,
+            "depth_source": mode == .depthScan ? "arkit_scene_depth" : "arkit_captured_depth_data",
             "records_depth_bin": false,
             "records_frame_metadata": true,
             "records_face_metadata": mode == .faceScan,
             "capture_format": mode.captureFormat,
             "dataset_layout": [
                 "rgb": "rgb.mov",
-                "metadata": "metadata/frames_0000.jsonl"
-            ]
-        ]
-
-        if mode == .depthScan {
-            metadata["dataset_layout"] = [
-                "rgb": "rgb.mov",
                 "metadata": "metadata/frames_0000.jsonl",
                 "depth_video": "depth/depth_packed_hevc.mov"
             ]
-        }
+        ]
 
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: metadataURL, options: .atomic)

@@ -6,6 +6,7 @@
 //
 
 import ARKit
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -36,10 +37,13 @@ struct SceneCaptureFrameSnapshot {
     let rgbURL: URL
     let rgbRelativePath: String
     let rgbPresentationTime: CMTime
+    let rgbTrackTransform: CGAffineTransform
     let depthVideoURL: URL
     let depthVideoRelativePath: String
     let width: Int
     let height: Int
+    let projectionViewportWidth: CGFloat
+    let projectionViewportHeight: CGFloat
     let imageOrientationName: String
     let projectionOrientationName: String
     let requiredOrientationName: String

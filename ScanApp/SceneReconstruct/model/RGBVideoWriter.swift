@@ -16,7 +16,7 @@ final class RGBVideoWriter {
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private var isFinished = false
 
-    init(url: URL, width: Int, height: Int) throws {
+    init(url: URL, width: Int, height: Int, transform: CGAffineTransform = .identity) throws {
         guard width > 0, height > 0 else {
             throw SceneCaptureRecorderError.invalidVideoDimensions(width: width, height: height)
         }
@@ -34,6 +34,7 @@ final class RGBVideoWriter {
         ]
         input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = true
+        input.transform = transform
 
         let attributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
