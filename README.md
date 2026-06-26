@@ -4,4 +4,13 @@ This app use ARKit scan to export depth binary data, images and metadata(camera-
 
 ## Features
 - Scan data
-- Export and create usdz and ply files.
+
+## Dataset directory
+`depth/depth_packed_hevc.mov`: quantized depth video
+`metadata/frames_XXXX.jsonl`: Scanned metadata, including necessory information for 3DGS training and timestamp for video frame.
+`rgb.mov`: The record of ARKit.
+`session.json`: Description of the dataset.
+
+## Note
+
+- ARKitTrackingState may give you normal state while relocation, the relocation causes camera pose drift. 
