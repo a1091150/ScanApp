@@ -9,24 +9,28 @@ import Foundation
 
 final class CaptureLibrary {
     private let fileManager: FileManager
+    private let mode: SceneCaptureMode
 
-    init(fileManager: FileManager = .default) {
+    init(mode: SceneCaptureMode = .depthScan, fileManager: FileManager = .default) {
+        self.mode = mode
         self.fileManager = fileManager
     }
 
     var scanRootDirectory: URL {
         applicationSupportDirectory
-            .appendingPathComponent("SceneReconstructionScans", isDirectory: true)
+            .appendingPathComponent(mode.directoryName, isDirectory: true)
     }
 
     var publicExportRootDirectory: URL {
         documentsDirectory
             .appendingPathComponent("ScanAppExports", isDirectory: true)
-            .appendingPathComponent("SceneReconstructionScans", isDirectory: true)
+            .appendingPathComponent(mode.directoryName, isDirectory: true)
     }
 
     func loadSessions() throws -> [CapturedScanSession] {
-        try migrateLegacySessionsIfNeeded()
+        if mode == .depthScan {
+            try migrateLegacySessionsIfNeeded()
+        }
 
         guard fileManager.fileExists(atPath: scanRootDirectory.path) else {
             return []

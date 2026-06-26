@@ -39,7 +39,7 @@ final class SceneReconstructionStatusView: UIVisualEffectView {
         trackingLabel.text = "Tracking: \(trackingStatus)"
         depthLabel.text = depthStatus
         confidenceLabel.text = confidenceStatus
-        imageCaptureLabel.text = "Saved images/depth: \(savedImageCount) / \(savedDepthFrameCount)"
+        imageCaptureLabel.text = "Saved RGB/depth: \(savedImageCount) / \(savedDepthFrameCount)"
         imageDecisionLabel.text = "Image recorder: \(imageDecision)"
     }
 

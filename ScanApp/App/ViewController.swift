@@ -30,6 +30,17 @@ class ViewController: UIViewController {
         return button
     }()
 
+    private let faceCapturedFilesButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.setTitle("Face Captures", for: .normal)
+        button.titleLabel?.font = .preferredFont(forTextStyle: .headline)
+        button.tintColor = .white
+        button.backgroundColor = .systemPurple
+        button.layer.cornerRadius = 8
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }()
+
     private let buttonStack = UIStackView()
 
     override func viewDidLoad() {
@@ -42,6 +53,7 @@ class ViewController: UIViewController {
     private func configureButtons() {
         scannerButton.addTarget(self, action: #selector(openScanner), for: .touchUpInside)
         capturedFilesButton.addTarget(self, action: #selector(openCapturedFiles), for: .touchUpInside)
+        faceCapturedFilesButton.addTarget(self, action: #selector(openFaceCapturedFiles), for: .touchUpInside)
 
         buttonStack.axis = .vertical
         buttonStack.spacing = 14
@@ -50,6 +62,7 @@ class ViewController: UIViewController {
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.addArrangedSubview(scannerButton)
         buttonStack.addArrangedSubview(capturedFilesButton)
+        buttonStack.addArrangedSubview(faceCapturedFilesButton)
 
         view.addSubview(buttonStack)
 
@@ -58,7 +71,8 @@ class ViewController: UIViewController {
             buttonStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
             buttonStack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             scannerButton.heightAnchor.constraint(equalToConstant: 52),
-            capturedFilesButton.heightAnchor.constraint(equalToConstant: 52)
+            capturedFilesButton.heightAnchor.constraint(equalToConstant: 52),
+            faceCapturedFilesButton.heightAnchor.constraint(equalToConstant: 52)
         ])
     }
 
@@ -69,6 +83,10 @@ class ViewController: UIViewController {
 
     @objc private func openCapturedFiles() {
         open(viewController: CapturedFilesViewController())
+    }
+
+    @objc private func openFaceCapturedFiles() {
+        open(viewController: FaceCapturedFilesViewController())
     }
 
     private func open(viewController: UIViewController) {

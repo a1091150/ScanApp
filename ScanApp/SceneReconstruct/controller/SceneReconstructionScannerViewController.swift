@@ -21,6 +21,10 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private let captureRecorder = SceneCaptureRecorder()
 
     private let statusView = SceneReconstructionStatusView()
+    private let modeControl = UISegmentedControl(items: [
+        SceneCaptureMode.depthScan.title,
+        SceneCaptureMode.faceScan.title
+    ])
     private let primaryButton = UIButton(type: .system)
     private let saveResetButton = UIButton(type: .system)
 
@@ -32,11 +36,11 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private var confidenceStatus = "Confidence: unavailable"
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-        .landscapeRight
+        selectedCaptureMode.supportedInterfaceOrientations
     }
 
     override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
-        .landscapeRight
+        selectedCaptureMode.preferredInterfaceOrientation
     }
 
     override var shouldAutorotate: Bool {
@@ -46,7 +50,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        title = "ARKit Depth Scan"
+        title = "ARKit Scan"
         view.backgroundColor = .black
         configureARView()
         configureUI()
@@ -76,6 +80,7 @@ final class SceneReconstructionScannerViewController: UIViewController {
     }
 
     private func configureUI() {
+        configureModeControl()
         configureButtons()
         configureStatusPanel()
     }
@@ -91,6 +96,15 @@ final class SceneReconstructionScannerViewController: UIViewController {
     }
 
     private func evaluateDeviceSupport() {
+        switch selectedCaptureMode {
+        case .depthScan:
+            evaluateDepthScanSupport()
+        case .faceScan:
+            evaluateFaceScanSupport()
+        }
+    }
+
+    private func evaluateDepthScanSupport() {
         guard ARWorldTrackingConfiguration.isSupported else {
             canStartScan = false
             supportStatus = "Unsupported: world tracking unavailable"
@@ -107,6 +121,34 @@ final class SceneReconstructionScannerViewController: UIViewController {
             canStartScan = false
             supportStatus = "Unsupported: scene depth requires LiDAR"
         }
+    }
+
+    private func evaluateFaceScanSupport() {
+        guard ARFaceTrackingConfiguration.isSupported else {
+            canStartScan = false
+            supportStatus = "Unsupported: face tracking unavailable"
+            return
+        }
+
+        canStartScan = true
+        supportStatus = ARFaceTrackingConfiguration.supportsWorldTracking
+            ? "Supported: face tracking + world tracking"
+            : "Supported: face tracking"
+    }
+
+    private func configureModeControl() {
+        modeControl.selectedSegmentIndex = SceneCaptureMode.depthScan.rawValue
+        modeControl.translatesAutoresizingMaskIntoConstraints = false
+        modeControl.selectedSegmentTintColor = .systemBlue
+        modeControl.addTarget(self, action: #selector(handleModeChanged), for: .valueChanged)
+
+        view.addSubview(modeControl)
+        NSLayoutConstraint.activate([
+            modeControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            modeControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            modeControl.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -74),
+            modeControl.heightAnchor.constraint(equalToConstant: 36)
+        ])
     }
 
     private func configureButtons() {
@@ -167,6 +209,17 @@ final class SceneReconstructionScannerViewController: UIViewController {
         }
     }
 
+    @objc private func handleModeChanged() {
+        guard scanState == .idle else { return }
+        viewModel.resetScanDirectory()
+        depthStatus = selectedCaptureMode == .depthScan ? "Depth: unavailable" : "Face: unavailable"
+        confidenceStatus = selectedCaptureMode == .depthScan ? "Confidence: unavailable" : "Face metadata: unavailable"
+        evaluateDeviceSupport()
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+        navigationController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        updateStats()
+    }
+
     @objc private func closeScanner() {
         dismiss(animated: true)
     }
@@ -174,8 +227,8 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private func startScanning() {
         captureRecorder.reset()
         isRecordingImages = false
-        depthStatus = "Depth: unavailable"
-        confidenceStatus = "Confidence: unavailable"
+        depthStatus = selectedCaptureMode == .depthScan ? "Depth: unavailable" : "Face: unavailable"
+        confidenceStatus = selectedCaptureMode == .depthScan ? "Confidence: unavailable" : "Face metadata: unavailable"
         viewModel.resetScanDirectory()
         runScanSession(resetTracking: true)
     }
@@ -185,11 +238,44 @@ final class SceneReconstructionScannerViewController: UIViewController {
     }
 
     private func runScanSession(resetTracking: Bool) {
+        let mode = selectedCaptureMode
+        evaluateDeviceSupport()
+        guard canStartScan else {
+            scanState = .idle
+            updateStats()
+            return
+        }
+
+        let configuration: ARConfiguration
+
+        switch mode {
+        case .depthScan:
+            configuration = makeDepthScanConfiguration()
+        case .faceScan:
+            configuration = makeFaceScanConfiguration()
+        }
+
+        do {
+            let directory = try viewModel.currentScanDirectory(mode: mode)
+            try captureRecorder.start(sessionDirectory: directory, mode: mode)
+            isRecordingImages = true
+            let options: ARSession.RunOptions = resetTracking ? [.resetTracking] : []
+            arView.session.run(configuration, options: options)
+            scanState = .recording
+            updateStats()
+        } catch {
+            scanState = .idle
+            isRecordingImages = false
+            showAlert(title: "Scan Start Failed", message: error.localizedDescription)
+            updateStats()
+        }
+    }
+
+    private func makeDepthScanConfiguration() -> ARWorldTrackingConfiguration {
         guard ARWorldTrackingConfiguration.isSupported else {
             canStartScan = false
             supportStatus = "Unsupported: world tracking unavailable"
-            updateStats()
-            return
+            return ARWorldTrackingConfiguration()
         }
 
         let configuration = ARWorldTrackingConfiguration()
@@ -203,28 +289,21 @@ final class SceneReconstructionScannerViewController: UIViewController {
         } else {
             canStartScan = false
             supportStatus = "Unsupported: scene depth requires LiDAR"
-            scanState = .idle
-            updateStats()
-            return
+            return configuration
         }
 
         configuration.environmentTexturing = .automatic
         configuration.isLightEstimationEnabled = true
+        return configuration
+    }
 
-        do {
-            let directory = try viewModel.currentScanDirectory()
-            try captureRecorder.start(sessionDirectory: directory)
-            isRecordingImages = true
-            let options: ARSession.RunOptions = resetTracking ? [.resetTracking] : []
-            arView.session.run(configuration, options: options)
-            scanState = .recording
-            updateStats()
-        } catch {
-            scanState = .idle
-            isRecordingImages = false
-            showAlert(title: "Scan Start Failed", message: error.localizedDescription)
-            updateStats()
+    private func makeFaceScanConfiguration() -> ARFaceTrackingConfiguration {
+        let configuration = ARFaceTrackingConfiguration()
+        if ARFaceTrackingConfiguration.supportsWorldTracking {
+            configuration.isWorldTrackingEnabled = true
         }
+        configuration.isLightEstimationEnabled = true
+        return configuration
     }
 
     private func pauseScanning() {
@@ -249,10 +328,11 @@ final class SceneReconstructionScannerViewController: UIViewController {
         }
         captureRecorder.reset()
         isRecordingImages = false
-        depthStatus = "Depth: unavailable"
-        confidenceStatus = "Confidence: unavailable"
+        depthStatus = selectedCaptureMode == .depthScan ? "Depth: unavailable" : "Face: unavailable"
+        confidenceStatus = selectedCaptureMode == .depthScan ? "Confidence: unavailable" : "Face metadata: unavailable"
         viewModel.resetScanDirectory()
         scanState = .idle
+        evaluateDeviceSupport()
         updateStats()
     }
 
@@ -274,18 +354,19 @@ final class SceneReconstructionScannerViewController: UIViewController {
     private func updateButtonState() {
         primaryButton.isEnabled = canStartScan
         primaryButton.alpha = canStartScan ? 1 : 0.55
+        modeControl.isEnabled = scanState == .idle
 
         switch scanState {
         case .idle:
-            primaryButton.setTitle("Start Scan", for: .normal)
+            primaryButton.setTitle("Start \(selectedCaptureMode.title)", for: .normal)
             primaryButton.backgroundColor = .systemGreen
             saveResetButton.isHidden = true
         case .recording:
-            primaryButton.setTitle("Pause Scan", for: .normal)
+            primaryButton.setTitle("Pause \(selectedCaptureMode.title)", for: .normal)
             primaryButton.backgroundColor = .systemOrange
             saveResetButton.isHidden = false
         case .paused:
-            primaryButton.setTitle("Continue Scan", for: .normal)
+            primaryButton.setTitle("Continue \(selectedCaptureMode.title)", for: .normal)
             primaryButton.backgroundColor = .systemGreen
             saveResetButton.isHidden = false
         }
@@ -301,6 +382,12 @@ final class SceneReconstructionScannerViewController: UIViewController {
         let depthMap = depthData.depthMap
         depthStatus = "Depth: \(CVPixelBufferGetWidth(depthMap)) x \(CVPixelBufferGetHeight(depthMap))"
         confidenceStatus = "Confidence: \(depthData.confidenceMap == nil ? "no" : "yes")"
+    }
+
+    private func updateFaceStatus(from frame: ARFrame) {
+        let faceCount = frame.anchors.compactMap { $0 as? ARFaceAnchor }.count
+        depthStatus = "Face: \(faceCount)"
+        confidenceStatus = "Face metadata: JSONL"
     }
 
     private func trackingText(for trackingState: ARCamera.TrackingState?) -> String {
@@ -341,7 +428,12 @@ final class SceneReconstructionScannerViewController: UIViewController {
 
 extension SceneReconstructionScannerViewController: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        updateDepthStatus(from: frame)
+        switch selectedCaptureMode {
+        case .depthScan:
+            updateDepthStatus(from: frame)
+        case .faceScan:
+            updateFaceStatus(from: frame)
+        }
         captureRecorder.process(frame: frame, interfaceOrientation: currentInterfaceOrientation)
         updateStats(trackingState: frame.camera.trackingState)
     }
@@ -369,7 +461,11 @@ extension SceneReconstructionScannerViewController: ARSessionDelegate {
 }
 
 private extension SceneReconstructionScannerViewController {
+    var selectedCaptureMode: SceneCaptureMode {
+        SceneCaptureMode(rawValue: modeControl.selectedSegmentIndex) ?? .depthScan
+    }
+
     var currentInterfaceOrientation: UIInterfaceOrientation {
-        view.window?.windowScene?.interfaceOrientation ?? .landscapeRight
+        view.window?.windowScene?.interfaceOrientation ?? selectedCaptureMode.preferredInterfaceOrientation
     }
 }
